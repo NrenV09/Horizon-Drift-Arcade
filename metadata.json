@@ -1,0 +1,6 @@
+{
+  "name": "Horizon Pulse: Golden Hour Festival",
+  "description": "A 3D open-world arcade driving game inspired by Forza Horizon featuring procedural sunset terrain, Cannon-es RaycastVehicle physics, drifting skill chains, and UnrealBloom post-processing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
