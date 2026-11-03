@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  CAR_CATALOG,
+  CAR_ORDER,
   computeAnalogSteerFromPad,
   computeFourWheelSurfacePose,
   computeSafeNitroImpulse,
@@ -8,10 +10,14 @@ import {
   computeTerrainHeight,
   computeVehicleTelemetry,
   createInitialSkillState,
+  getCarSpec,
   getHighwayPointAtAngle,
   getRoadDistanceInfo,
+  getScenerySpec,
   getTimeOfDayLightingProfile,
   ROAD_HALF_WIDTH,
+  SCENERY_CATALOG,
+  SCENERY_ORDER,
   stepSkillChain,
 } from './rules.ts';
 
@@ -213,3 +219,34 @@ test('stabilized Nitro impulse applies planar horizontal thrust, aerodynamic dow
   assert.equal(cappedBoost.dvx, 0);
   assert.equal(cappedBoost.dvz, 0);
 });
+
+test('car catalog defines 3 distinct playable vehicles (Apex V10 GT, Kaze RX-79 Drift, Titan Baja 4x4)', () => {
+  assert.equal(CAR_ORDER.length, 3);
+  assert.deepEqual(CAR_ORDER, ['apex', 'kaze', 'titan']);
+
+  const apex = getCarSpec('apex');
+  const kaze = getCarSpec('kaze');
+  const titan = getCarSpec('titan');
+
+  // Apex has highest top speed, Kaze has highest drift rating, Titan has highest offroad rating & ride height
+  assert.ok(apex.maxSpeedKmh > kaze.maxSpeedKmh && kaze.maxSpeedKmh > titan.maxSpeedKmh);
+  assert.ok(kaze.driftScoreMultiplier > apex.driftScoreMultiplier);
+  assert.ok(titan.rideHeightOffset > apex.rideHeightOffset);
+  assert.ok(titan.wheelRadius > apex.wheelRadius);
+  assert.equal(getCarSpec('invalid').id, 'apex');
+});
+
+test('scenery catalog defines 3 distinct festival worlds (Red Rock Canyon, Alpine Glacier Pass, Neon Cyber Bay)', () => {
+  assert.equal(SCENERY_ORDER.length, 3);
+  assert.deepEqual(SCENERY_ORDER, ['canyon', 'alpine', 'cyber']);
+
+  for (const sceneryId of SCENERY_ORDER) {
+    const spec = SCENERY_CATALOG[sceneryId];
+    assert.ok(spec.name.length > 3);
+    assert.ok(spec.treePaletteHex.length >= 4);
+    assert.ok(spec.rockPaletteHex.length >= 4);
+    assert.ok(spec.terrainPalette.mesaTopHex !== spec.terrainPalette.valleyLowHex);
+  }
+  assert.equal(getScenerySpec('unknown').id, 'canyon');
+});
+

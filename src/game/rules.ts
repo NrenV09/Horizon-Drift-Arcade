@@ -577,3 +577,254 @@ export function computeSafeNitroImpulse(input: {
     dvz: dirZ * boostAccel,
   };
 }
+
+export type CarId = 'apex' | 'kaze' | 'titan';
+
+export interface CarSpec {
+  id: CarId;
+  name: string;
+  subtitle: string;
+  classTag: string;
+  defaultPaint: string;
+  maxSpeedKmh: number;
+  maxNitroKmh: number;
+  accelRate: number;
+  steerRate: number;
+  driftSteerMultiplier: number;
+  driftLateralDamping: number;
+  driftScoreMultiplier: number;
+  airScoreMultiplier: number;
+  rideHeightOffset: number;
+  wheelRadius: number;
+  wheelbase: number;
+  trackWidth: number;
+  engineBaseHz: number;
+  stats: {
+    speed: number;
+    handling: number;
+    drift: number;
+    offroad: number;
+  };
+}
+
+export const CAR_ORDER: CarId[] = ['apex', 'kaze', 'titan'];
+
+export const CAR_CATALOG: Record<CarId, CarSpec> = {
+  apex: {
+    id: 'apex',
+    name: 'Apex V10 GT',
+    subtitle: 'Mid-Engine Clearcoat Supercar',
+    classTag: 'S1 · 900 SUPERCAR',
+    defaultPaint: '#ff5511',
+    maxSpeedKmh: 262,
+    maxNitroKmh: 298,
+    accelRate: 25.0,
+    steerRate: 2.15,
+    driftSteerMultiplier: 1.25,
+    driftLateralDamping: 3.2,
+    driftScoreMultiplier: 1.0,
+    airScoreMultiplier: 1.0,
+    rideHeightOffset: 0.56,
+    wheelRadius: 0.42,
+    wheelbase: 2.7,
+    trackWidth: 1.86,
+    engineBaseHz: 54,
+    stats: {
+      speed: 96,
+      handling: 90,
+      drift: 82,
+      offroad: 68,
+    },
+  },
+  kaze: {
+    id: 'kaze',
+    name: 'Kaze RX-79 Drift',
+    subtitle: 'Widebody Twin-Turbo JDM Street Spec',
+    classTag: 'A · 800 DRIFT TUNER',
+    defaultPaint: '#00e5ff',
+    maxSpeedKmh: 246,
+    maxNitroKmh: 284,
+    accelRate: 26.8,
+    steerRate: 2.48,
+    driftSteerMultiplier: 1.44,
+    driftLateralDamping: 2.35,
+    driftScoreMultiplier: 1.35,
+    airScoreMultiplier: 1.0,
+    rideHeightOffset: 0.52,
+    wheelRadius: 0.4,
+    wheelbase: 2.58,
+    trackWidth: 1.9,
+    engineBaseHz: 66,
+    stats: {
+      speed: 88,
+      handling: 94,
+      drift: 99,
+      offroad: 62,
+    },
+  },
+  titan: {
+    id: 'titan',
+    name: 'Titan Baja 4x4',
+    subtitle: 'Lifted V8 Desert Trophy Raid Truck',
+    classTag: 'S1 · 880 EXTREME OFFROAD',
+    defaultPaint: '#a3e635',
+    maxSpeedKmh: 236,
+    maxNitroKmh: 274,
+    accelRate: 28.2,
+    steerRate: 2.05,
+    driftSteerMultiplier: 1.18,
+    driftLateralDamping: 3.6,
+    driftScoreMultiplier: 1.05,
+    airScoreMultiplier: 1.45,
+    rideHeightOffset: 0.78,
+    wheelRadius: 0.54,
+    wheelbase: 2.92,
+    trackWidth: 2.08,
+    engineBaseHz: 42,
+    stats: {
+      speed: 84,
+      handling: 82,
+      drift: 78,
+      offroad: 99,
+    },
+  },
+};
+
+export function getCarSpec(id?: string | null): CarSpec {
+  if (id && id in CAR_CATALOG) {
+    return CAR_CATALOG[id as CarId];
+  }
+  return CAR_CATALOG.apex;
+}
+
+export type SceneryId = 'canyon' | 'alpine' | 'cyber';
+
+export interface ScenerySpec {
+  id: SceneryId;
+  name: string;
+  subtitle: string;
+  regionTag: string;
+  accentColor: string;
+  defaultTimeOfDay: TimeOfDayMode;
+  skyTintHex: Record<TimeOfDayMode, number>;
+  fogDensityMultiplier: number;
+  waterColorHex: number;
+  waterOpacity: number;
+  waterRoughness: number;
+  treePaletteHex: number[];
+  treeTrunkHex: number;
+  rockPaletteHex: number[];
+  archColorHex: number;
+  terrainPalette: {
+    lakeBedHex: number;
+    valleyLowHex: number;
+    valleyMidHex: number;
+    canyonSlopeHex: number;
+    mesaTopHex: number;
+    peakCapHex: number;
+    shoulderBlendHex: number;
+  };
+}
+
+export const SCENERY_ORDER: SceneryId[] = ['canyon', 'alpine', 'cyber'];
+
+export const SCENERY_CATALOG: Record<SceneryId, ScenerySpec> = {
+  canyon: {
+    id: 'canyon',
+    name: 'Red Rock Canyon',
+    subtitle: 'Sandstone Mesas & Turquoise Desert Oasis',
+    regionTag: 'STAGE 01 · SONORAN OASIS',
+    accentColor: '#ff8a2b',
+    defaultTimeOfDay: 'sunset',
+    skyTintHex: {
+      sunset: 0x6e3a4c,
+      night: 0x060914,
+      day: 0x78a9d4,
+    },
+    fogDensityMultiplier: 1.0,
+    waterColorHex: 0x0ea5e9,
+    waterOpacity: 0.9,
+    waterRoughness: 0.12,
+    treePaletteHex: [0x2e6b34, 0x3f7a2e, 0x5c7428, 0x8f5e26, 0x245838, 0xd97734],
+    treeTrunkHex: 0x42291d,
+    rockPaletteHex: [0xa84c32, 0x8c3b28, 0xc26a3d, 0x6e3a4c, 0x785240],
+    archColorHex: 0xa8462a,
+    terrainPalette: {
+      lakeBedHex: 0xd6b578,
+      valleyLowHex: 0x486b38,
+      valleyMidHex: 0x7c6838,
+      canyonSlopeHex: 0xb85834,
+      mesaTopHex: 0x8a3324,
+      peakCapHex: 0xe2e8f0,
+      shoulderBlendHex: 0x222628,
+    },
+  },
+  alpine: {
+    id: 'alpine',
+    name: 'Alpine Glacier Pass',
+    subtitle: 'Snow-Crowned Peaks & Frozen Crystal Fjord',
+    regionTag: 'STAGE 02 · NORDIC SUMMIT',
+    accentColor: '#00f0ff',
+    defaultTimeOfDay: 'day',
+    skyTintHex: {
+      sunset: 0x56466e,
+      night: 0x050b1a,
+      day: 0x8abce6,
+    },
+    fogDensityMultiplier: 0.95,
+    waterColorHex: 0x38bdf8,
+    waterOpacity: 0.94,
+    waterRoughness: 0.06,
+    treePaletteHex: [0x1e4d3b, 0x285e48, 0xdbeafe, 0x163b2d, 0x93c5fd, 0x336650],
+    treeTrunkHex: 0x33241b,
+    rockPaletteHex: [0x475569, 0x64748b, 0x94a3b8, 0x334155, 0xcbd5e1],
+    archColorHex: 0x64748b,
+    terrainPalette: {
+      lakeBedHex: 0x7dd3fc,
+      valleyLowHex: 0xcbd5e1,
+      valleyMidHex: 0x94a3b8,
+      canyonSlopeHex: 0x64748b,
+      mesaTopHex: 0xe2e8f0,
+      peakCapHex: 0xffffff,
+      shoulderBlendHex: 0x1e293b,
+    },
+  },
+  cyber: {
+    id: 'cyber',
+    name: 'Neon Cyber Bay',
+    subtitle: 'Obsidian Volcanic Cliffs & Sakura Synth Coast',
+    regionTag: 'STAGE 03 · NEO BAYSHORE',
+    accentColor: '#ff2a85',
+    defaultTimeOfDay: 'night',
+    skyTintHex: {
+      sunset: 0x4a1942,
+      night: 0x070412,
+      day: 0x52689f,
+    },
+    fogDensityMultiplier: 0.92,
+    waterColorHex: 0x00f0ff,
+    waterOpacity: 0.88,
+    waterRoughness: 0.08,
+    treePaletteHex: [0xff2a85, 0xf472b6, 0x00f0ff, 0xa855f7, 0xfb7185, 0x38bdf8],
+    treeTrunkHex: 0x1e1b2e,
+    rockPaletteHex: [0x1e1b4b, 0x311042, 0x0f172a, 0x4c1d95, 0x1e293b],
+    archColorHex: 0x3b0764,
+    terrainPalette: {
+      lakeBedHex: 0x0284c7,
+      valleyLowHex: 0x111827,
+      valleyMidHex: 0x1e1b4b,
+      canyonSlopeHex: 0x311042,
+      mesaTopHex: 0x701a75,
+      peakCapHex: 0x00f0ff,
+      shoulderBlendHex: 0x0f172a,
+    },
+  },
+};
+
+export function getScenerySpec(id?: string | null): ScenerySpec {
+  if (id && id in SCENERY_CATALOG) {
+    return SCENERY_CATALOG[id as SceneryId];
+  }
+  return SCENERY_CATALOG.canyon;
+}
+
