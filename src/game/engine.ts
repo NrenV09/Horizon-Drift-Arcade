@@ -13,6 +13,7 @@ import {
   CarId,
   CarSpec,
   computeAnalogSteerFromPad,
+  computeEffectiveTouchDriveInput,
   computeSafeNitroImpulse,
   computeTerrainHeight,
   getCarSpec,
@@ -1538,6 +1539,7 @@ const touchInput = {
   drift: false,
   nitro: false,
 };
+let autoGasEnabled = false;
 
 let nitroCharge = 1;
 let currentSteerAngle = 0;
@@ -1614,7 +1616,16 @@ const dockSceneryBtnEl = document.getElementById('dock-scenery-btn');
 const dockCamBtnEl = document.getElementById('dock-cam-btn');
 const dockTimeBtnEl = document.getElementById('dock-time-btn');
 const btnTimeTopEl = document.getElementById('btn-time-top');
+const touchControlsLayerEl = document.getElementById('touch-controls-layer');
+const touchAutoGasBtnEl = document.getElementById('touch-autogas-btn');
+const touchCarBtnEl = document.getElementById('touch-car-btn');
+const touchWorldBtnEl = document.getElementById('touch-world-btn');
+const touchCamBtnEl = document.getElementById('touch-cam-btn');
 const touchTimeBtnEl = document.getElementById('touch-time-btn');
+const touchSteerReadoutEl = document.getElementById('touch-steer-readout');
+const touchNitroFillEl = document.getElementById('touch-nitro-fill');
+const touchGasBtnEl = document.getElementById('touch-gas');
+const touchGasSubEl = document.getElementById('touch-gas-sub');
 const btnTouchTopEl = document.getElementById('btn-touch-top');
 const radarCtx = (document.getElementById('radar-canvas') as HTMLCanvasElement).getContext('2d')!;
 
@@ -1755,9 +1766,10 @@ function applyTimeOfDay(mode: TimeOfDayMode) {
   }
 
   const label = mode.toUpperCase();
+  const prettyMode = mode.charAt(0).toUpperCase() + mode.slice(1);
   if (btnTimeTopEl) btnTimeTopEl.textContent = `${label} [L]`;
-  if (dockTimeBtnEl) dockTimeBtnEl.textContent = `Sky: ${mode.charAt(0).toUpperCase() + mode.slice(1)} [L]`;
-  if (touchTimeBtnEl) touchTimeBtnEl.textContent = label;
+  if (dockTimeBtnEl) dockTimeBtnEl.textContent = `Sky: ${prettyMode} [L]`;
+  if (touchTimeBtnEl) touchTimeBtnEl.textContent = `Sky: ${prettyMode}`;
   document.querySelectorAll<HTMLElement>('[data-time-select]').forEach((btn) => {
     const active = btn.dataset.timeSelect === mode;
     btn.classList.toggle('active', active);
@@ -1818,9 +1830,12 @@ function selectCar(carId: CarId, applyDefaultPaintColor = true) {
   if (menuActiveCarSummaryEl) {
     menuActiveCarSummaryEl.textContent = `${currentCarSpec.name} — ${currentCarSpec.subtitle}`;
   }
+  const shortName = carId === 'apex' ? 'Apex V10' : carId === 'kaze' ? 'Kaze RX-79' : 'Titan 4x4';
   if (dockCarBtnEl) {
-    const shortName = carId === 'apex' ? 'Apex V10' : carId === 'kaze' ? 'Kaze RX-79' : 'Titan 4x4';
     dockCarBtnEl.textContent = `Car: ${shortName} [V]`;
+  }
+  if (touchCarBtnEl) {
+    touchCarBtnEl.textContent = `Car: ${carId === 'apex' ? 'Apex' : carId === 'kaze' ? 'Kaze' : 'Titan'}`;
   }
   updateHudCarWorldBanner();
 
@@ -1890,9 +1905,12 @@ function selectScenery(sceneryId: SceneryId, syncDefaultTimeOfDay = true) {
   if (menuActiveScenerySummaryEl) {
     menuActiveScenerySummaryEl.textContent = `${currentScenerySpec.name} — ${currentScenerySpec.subtitle}`;
   }
+  const shortWorld = sceneryId === 'canyon' ? 'Canyon' : sceneryId === 'alpine' ? 'Alpine' : 'Cyber Bay';
   if (dockSceneryBtnEl) {
-    const shortWorld = sceneryId === 'canyon' ? 'Canyon' : sceneryId === 'alpine' ? 'Alpine' : 'Cyber Bay';
     dockSceneryBtnEl.textContent = `World: ${shortWorld} [B]`;
+  }
+  if (touchWorldBtnEl) {
+    touchWorldBtnEl.textContent = `World: ${shortWorld}`;
   }
   updateHudCarWorldBanner();
 }
@@ -1947,6 +1965,42 @@ if (touchTimeBtnEl) {
     cycleTimeOfDay();
   });
 }
+if (touchCarBtnEl) {
+  touchCarBtnEl.addEventListener('click', (e) => {
+    e.preventDefault();
+    cycleCar();
+  });
+}
+if (touchWorldBtnEl) {
+  touchWorldBtnEl.addEventListener('click', (e) => {
+    e.preventDefault();
+    cycleScenery();
+  });
+}
+
+function setAutoGas(enabled: boolean) {
+  autoGasEnabled = !!enabled;
+  if (touchAutoGasBtnEl) {
+    touchAutoGasBtnEl.textContent = `Auto-Gas: ${autoGasEnabled ? 'ON' : 'Off'}`;
+    touchAutoGasBtnEl.classList.toggle('autogas-active', autoGasEnabled);
+    touchAutoGasBtnEl.setAttribute('aria-pressed', String(autoGasEnabled));
+  }
+  if (touchGasSubEl) {
+    touchGasSubEl.textContent = autoGasEnabled ? 'Auto ON' : 'Thrust';
+  }
+  if (touchGasBtnEl) {
+    touchGasBtnEl.classList.toggle('active', autoGasEnabled || touchInput.gas);
+  }
+}
+
+if (touchAutoGasBtnEl) {
+  touchAutoGasBtnEl.addEventListener('click', (e) => {
+    e.preventDefault();
+    soundEngine.init();
+    setAutoGas(!autoGasEnabled);
+    soundEngine.playChime(autoGasEnabled ? 820 : 540, 0.1);
+  });
+}
 
 // Initialize URL Parameters & Default Selection
 const searchParams = new URLSearchParams(window.location.search);
@@ -1965,7 +2019,11 @@ let isTouchEnabled = false;
 function setTouchMode(enabled: boolean) {
   isTouchEnabled = !!enabled;
   document.body.dataset.touch = isTouchEnabled ? 'true' : 'false';
+  if (touchControlsLayerEl) {
+    touchControlsLayerEl.classList.toggle('visible', isTouchEnabled && gameState === 'playing');
+  }
   if (btnTouchTopEl) {
+    btnTouchTopEl.textContent = `Touch: ${isTouchEnabled ? 'ON' : 'OFF'} [T]`;
     btnTouchTopEl.style.borderColor = isTouchEnabled ? 'rgba(0, 240, 255, 0.75)' : '';
     btnTouchTopEl.style.color = isTouchEnabled ? '#00f0ff' : '';
   }
@@ -1975,6 +2033,8 @@ if (
   searchParams.get('touch') === '1'
 ) {
   setTouchMode(true);
+} else {
+  setTouchMode(false);
 }
 window.addEventListener(
   'touchstart',
@@ -2000,6 +2060,12 @@ function clearAllHeldInputs() {
   touchInput.brake = false;
   touchInput.drift = false;
   touchInput.nitro = false;
+  document.querySelectorAll('.touch-action-btn').forEach((el) => {
+    el.classList.remove('pressed');
+    if (el.id !== 'touch-gas' || !autoGasEnabled) {
+      el.classList.remove('active');
+    }
+  });
   resetAnalogSteerPad();
 }
 window.addEventListener('blur', clearAllHeldInputs);
@@ -2010,22 +2076,28 @@ document.addEventListener('visibilitychange', () => {
 function setGameState(nextState: 'title' | 'playing' | 'paused') {
   gameState = nextState;
   document.body.dataset.state = nextState;
+  if (touchControlsLayerEl) {
+    touchControlsLayerEl.classList.toggle('visible', isTouchEnabled && nextState === 'playing');
+  }
   if (nextState === 'title') {
     clearAllHeldInputs();
     titleScreenEl.removeAttribute('hidden');
     statusModalEl.setAttribute('hidden', '');
+    statusModalEl.classList.remove('visible');
   } else if (nextState === 'playing') {
     if (document.activeElement instanceof HTMLElement) {
       document.activeElement.blur();
     }
     titleScreenEl.setAttribute('hidden', '');
     statusModalEl.setAttribute('hidden', '');
+    statusModalEl.classList.remove('visible');
   } else if (nextState === 'paused') {
     clearAllHeldInputs();
-    modalStatXpEl.textContent = skillState.bankedScore.toLocaleString();
-    modalStatSpeedEl.textContent = String(Math.round(sessionTopSpeedKmh));
+    modalStatXpEl.textContent = `${skillState.bankedScore.toLocaleString()} XP`;
+    modalStatSpeedEl.textContent = `${Math.round(sessionTopSpeedKmh)} KMH`;
     modalStatGatesEl.textContent = `${gatesClearedCount} / ${GATE_COUNT}`;
     statusModalEl.removeAttribute('hidden');
+    statusModalEl.classList.add('visible');
   }
 }
 
@@ -2073,8 +2145,16 @@ document.getElementById('btn-menu-top')?.addEventListener('click', () => {
 
 function toggleCameraMode() {
   cameraMode = cameraMode === 'chase' ? 'hood' : 'chase';
+  const label = cameraMode === 'chase' ? 'Chase' : 'Hood';
   if (dockCamBtnEl) {
-    dockCamBtnEl.textContent = `Cam: ${cameraMode === 'chase' ? 'Chase [C]' : 'Hood [C]'}`;
+    dockCamBtnEl.textContent = `Cam: ${label} [C]`;
+  }
+  if (touchCamBtnEl) {
+    touchCamBtnEl.textContent = `Cam: ${label}`;
+  }
+  const topCamEl = document.getElementById('btn-camera-top');
+  if (topCamEl) {
+    topCamEl.textContent = `Cam: ${label} [C]`;
   }
 }
 if (dockCamBtnEl) dockCamBtnEl.addEventListener('click', toggleCameraMode);
@@ -2195,24 +2275,42 @@ window.addEventListener('keyup', (e) => {
   }
 });
 
-// Touch Steer Pad & Pedal Cluster
+// Touch Steer Pad & Multi-Touch Arcade Pedal Cluster
 const touchSteerPadEl = document.getElementById('touch-steer-pad');
 const touchSteerThumbEl = document.getElementById('touch-steer-thumb');
 const touchLeftEl = document.getElementById('touch-left');
 const touchRightEl = document.getElementById('touch-right');
 let activeSteerPointerId: number | null = null;
 
+function triggerHapticPulse(ms = 10) {
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      navigator.vibrate(ms);
+    }
+  } catch {
+    // Ignore on unsupported devices
+  }
+}
+
 function handleSteerPadMove(clientX: number) {
   if (!touchSteerPadEl || !touchSteerThumbEl) return;
   const rect = touchSteerPadEl.getBoundingClientRect();
-  const res = computeAnalogSteerFromPad(clientX, rect.left, rect.width);
+  const res = computeAnalogSteerFromPad(clientX, rect.left, rect.width, 62);
   touchInput.steerAnalog = res.steerInput;
-  touchInput.left = res.steerInput > 0.15;
-  touchInput.right = res.steerInput < -0.15;
-  touchSteerThumbEl.style.transform = `translateX(${res.thumbOffsetPx}px)`;
+  touchInput.left = res.zone === 'left';
+  touchInput.right = res.zone === 'right';
+  touchSteerThumbEl.style.transform = `translateX(${res.thumbOffsetPx}px) rotate(${res.steerDegrees}deg)`;
   touchSteerPadEl.setAttribute('aria-valuenow', String(res.ariaValueNow));
+  if (touchSteerReadoutEl) {
+    touchSteerReadoutEl.textContent =
+      res.zone === 'center'
+        ? 'CENTER'
+        : `${res.zone === 'left' ? 'L' : 'R'} ${Math.abs(res.steerDegrees)}°`;
+  }
   touchLeftEl?.classList.toggle('pressed', touchInput.left);
+  touchLeftEl?.classList.toggle('active', touchInput.left);
   touchRightEl?.classList.toggle('pressed', touchInput.right);
+  touchRightEl?.classList.toggle('active', touchInput.right);
 }
 
 function resetAnalogSteerPad() {
@@ -2224,17 +2322,24 @@ function resetAnalogSteerPad() {
     touchSteerPadEl.classList.remove('active');
     touchSteerPadEl.setAttribute('aria-valuenow', '0');
   }
-  if (touchSteerThumbEl) touchSteerThumbEl.style.transform = 'translateX(0px)';
-  touchLeftEl?.classList.remove('pressed');
-  touchRightEl?.classList.remove('pressed');
+  if (touchSteerThumbEl) {
+    touchSteerThumbEl.style.transform = 'translateX(0px) rotate(0deg)';
+  }
+  if (touchSteerReadoutEl) {
+    touchSteerReadoutEl.textContent = 'CENTER';
+  }
+  touchLeftEl?.classList.remove('pressed', 'active');
+  touchRightEl?.classList.remove('pressed', 'active');
 }
 
 if (touchSteerPadEl) {
   touchSteerPadEl.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     soundEngine.init();
+    if (!isTouchEnabled) setTouchMode(true);
     activeSteerPointerId = e.pointerId;
     touchSteerPadEl.classList.add('active');
+    triggerHapticPulse(8);
     try {
       touchSteerPadEl.setPointerCapture(e.pointerId);
     } catch {
@@ -2258,29 +2363,84 @@ if (touchSteerPadEl) {
   touchSteerPadEl.addEventListener('lostpointercapture', resetAnalogSteerPad);
 }
 
-function bindTouchPedal(id: string, key: 'gas' | 'brake' | 'drift' | 'nitro') {
+type TouchPedalKey = 'gas' | 'brake' | 'drift' | 'nitro';
+const activePedalPointers = new Map<number, TouchPedalKey>();
+const pedalElementMap: Record<TouchPedalKey, HTMLElement | null> = {
+  gas: document.getElementById('touch-gas'),
+  brake: document.getElementById('touch-brake'),
+  drift: document.getElementById('touch-drift'),
+  nitro: document.getElementById('touch-nitro'),
+};
+
+function syncTouchPedalStates() {
+  const held: Record<TouchPedalKey, boolean> = {
+    gas: false,
+    brake: false,
+    drift: false,
+    nitro: false,
+  };
+  for (const key of activePedalPointers.values()) {
+    held[key] = true;
+  }
+  (Object.keys(held) as TouchPedalKey[]).forEach((key) => {
+    touchInput[key] = held[key];
+    const el = pedalElementMap[key];
+    if (el) {
+      el.classList.toggle('pressed', held[key]);
+      el.classList.toggle('active', held[key] || (key === 'gas' && autoGasEnabled));
+    }
+  });
+}
+
+function resolvePedalKeyFromElement(target: Element | null): TouchPedalKey | null {
+  const btn = target?.closest('.touch-action-btn');
+  if (!btn) return null;
+  if (btn.id === 'touch-gas') return 'gas';
+  if (btn.id === 'touch-brake') return 'brake';
+  if (btn.id === 'touch-drift') return 'drift';
+  if (btn.id === 'touch-nitro') return 'nitro';
+  return null;
+}
+
+function bindTouchPedal(id: string, key: TouchPedalKey) {
   const el = document.getElementById(id);
   if (!el) return;
-  const setPressed = (val: boolean) => {
-    touchInput[key] = val;
-    el.classList.toggle('pressed', val);
-  };
   el.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     soundEngine.init();
+    if (!isTouchEnabled) setTouchMode(true);
+    triggerHapticPulse(12);
     try {
       el.setPointerCapture(e.pointerId);
     } catch {
       // Ignore
     }
-    setPressed(true);
+    activePedalPointers.set(e.pointerId, key);
+    syncTouchPedalStates();
   });
-  el.addEventListener('pointerup', (e) => {
+  el.addEventListener('pointermove', (e) => {
+    if (!activePedalPointers.has(e.pointerId)) return;
     e.preventDefault();
-    setPressed(false);
+    // Allow thumb sliding across adjacent pedals in the cluster
+    const hitEl = document.elementFromPoint(e.clientX, e.clientY);
+    const hoveredKey = resolvePedalKeyFromElement(hitEl);
+    if (hoveredKey && hoveredKey !== activePedalPointers.get(e.pointerId)) {
+      activePedalPointers.set(e.pointerId, hoveredKey);
+      triggerHapticPulse(8);
+      syncTouchPedalStates();
+    }
   });
-  el.addEventListener('pointercancel', () => setPressed(false));
-  el.addEventListener('lostpointercapture', () => setPressed(false));
+  const releasePointer = (e: PointerEvent) => {
+    e.preventDefault();
+    activePedalPointers.delete(e.pointerId);
+    syncTouchPedalStates();
+  };
+  el.addEventListener('pointerup', releasePointer);
+  el.addEventListener('pointercancel', releasePointer);
+  el.addEventListener('lostpointercapture', (e) => {
+    activePedalPointers.delete(e.pointerId);
+    syncTouchPedalStates();
+  });
 }
 
 bindTouchPedal('touch-gas', 'gas');
@@ -2493,11 +2653,24 @@ function tick() {
   const kmh = speedMs * 3.6;
   if (kmh > sessionTopSpeedKmh) sessionTopSpeedKmh = kmh;
 
-  const throttle = (keys.forward || touchInput.gas ? 1 : 0) - (keys.backward || touchInput.brake ? 1 : 0);
-  const digitalSteer = (keys.left || touchInput.left ? 1 : 0) - (keys.right || touchInput.right ? 1 : 0);
-  const steerInput = Math.abs(touchInput.steerAnalog) > 0.01 ? touchInput.steerAnalog : digitalSteer;
-  const handbrake = keys.handbrake || touchInput.drift;
-  const isBoosting = (keys.nitro || touchInput.nitro) && nitroCharge > 0.05;
+  const driveCmd = computeEffectiveTouchDriveInput({
+    keyForward: keys.forward,
+    keyBackward: keys.backward,
+    keyLeft: keys.left,
+    keyRight: keys.right,
+    keyHandbrake: keys.handbrake,
+    keyNitro: keys.nitro,
+    touchGas: touchInput.gas,
+    touchBrake: touchInput.brake,
+    touchLeft: touchInput.left,
+    touchRight: touchInput.right,
+    touchSteerAnalog: touchInput.steerAnalog,
+    touchDrift: touchInput.drift,
+    touchNitro: touchInput.nitro,
+    autoGasEnabled,
+    nitroCharge,
+  });
+  const { throttle, steerInput, handbrake, isBoosting } = driveCmd;
 
   const targetSteer = steerInput * THREE.MathUtils.lerp(0.46, 0.22, Math.min(1, kmh / 220));
   currentSteerAngle = THREE.MathUtils.damp(currentSteerAngle, targetSteer, 13, dt);
@@ -2900,6 +3073,9 @@ function tick() {
 
   hudRpmBarEl.style.transform = `scaleX(${rpmNorm.toFixed(3)})`;
   hudNitroBarEl.style.transform = `scaleX(${nitroCharge.toFixed(3)})`;
+  if (touchNitroFillEl) {
+    touchNitroFillEl.style.transform = `scaleX(${nitroCharge.toFixed(3)})`;
+  }
   hudSkillTimerEl.style.transform = `scaleX(${(skillState.cleanTimer / 3).toFixed(3)})`;
   soundEngine.update(rpmNorm, throttle, isDrifting, true, kmh, currentCarSpec.engineBaseHz);
 

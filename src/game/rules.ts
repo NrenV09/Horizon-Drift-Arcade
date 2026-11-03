@@ -407,7 +407,8 @@ export function stepSkillChain(
 
 /**
  * Computes proportional analog steering input from a horizontal touch/pointer coordinate
- * inside the virtual steering pad, including a center deadzone and thumb puck pixel offset.
+ * inside the virtual steering pad, including a center deadzone, thumb puck pixel offset,
+ * visual wheel rotation angle in degrees, and active directional zone.
  * Returns steerInput in [-1, 1] where +1 is full left turn and -1 is full right turn.
  */
 export function computeAnalogSteerFromPad(
@@ -416,10 +417,13 @@ export function computeAnalogSteerFromPad(
   rectWidth: number,
   maxThumbTravelPx = 56,
   deadzone = 0.06,
+  sensitivity = 1.0,
 ): {
   steerInput: number;
   thumbOffsetPx: number;
   ariaValueNow: number;
+  steerDegrees: number;
+  zone: 'left' | 'center' | 'right';
 } {
   const safeWidth = Math.max(1, rectWidth);
   const center = rectLeft + safeWidth * 0.5;
@@ -431,19 +435,80 @@ export function computeAnalogSteerFromPad(
   if (absRaw > deadzone) {
     const sign = Math.sign(rawNormalized);
     const rescaled = (absRaw - deadzone) / (1 - deadzone);
-    // Slight non-linear response curve for fine center control
-    shaped = sign * Math.pow(rescaled, 1.15);
+    // Slight non-linear response curve for fine center control, scaled by sensitivity
+    const curvePower = Math.max(0.75, Math.min(1.6, 1.15 / Math.max(0.5, sensitivity)));
+    shaped = Math.max(-1, Math.min(1, sign * Math.pow(rescaled, curvePower)));
   }
 
   // In vehicle coordinates, positive steer angle turns left, negative turns right
-  const steerInput = Number((-shaped).toFixed(4));
-  const thumbOffsetPx = Math.round(rawNormalized * maxThumbTravelPx);
-  const ariaValueNow = Math.round(rawNormalized * 100);
+  const steerInput = shaped === 0 ? 0 : Number((-shaped).toFixed(4)) || 0;
+  const thumbOffsetPx = Math.round(rawNormalized * maxThumbTravelPx) || 0;
+  const ariaValueNow = Math.round(rawNormalized * 100) || 0;
+  // Visual steering wheel rotation: negative (counter-clockwise) for left, positive (clockwise) for right
+  const steerDegrees = steerInput === 0 ? 0 : Math.round(-steerInput * 45) || 0;
+  const zone: 'left' | 'center' | 'right' =
+    steerInput > 0.12 ? 'left' : steerInput < -0.12 ? 'right' : 'center';
 
   return {
     steerInput,
     thumbOffsetPx,
     ariaValueNow,
+    steerDegrees,
+    zone,
+  };
+}
+
+export interface EffectiveDriveInputParams {
+  keyForward: boolean;
+  keyBackward: boolean;
+  keyLeft: boolean;
+  keyRight: boolean;
+  keyHandbrake: boolean;
+  keyNitro: boolean;
+  touchGas: boolean;
+  touchBrake: boolean;
+  touchLeft: boolean;
+  touchRight: boolean;
+  touchSteerAnalog: number;
+  touchDrift: boolean;
+  touchNitro: boolean;
+  autoGasEnabled: boolean;
+  nitroCharge: number;
+}
+
+/**
+ * Resolves unified vehicle control commands from keyboard and touch inputs,
+ * supporting Touch Auto-Gas (cruise control overridden by Brake) and Touch Nitro Auto-Throttle.
+ */
+export function computeEffectiveTouchDriveInput(input: EffectiveDriveInputParams): {
+  throttle: number;
+  steerInput: number;
+  handbrake: boolean;
+  isBoosting: boolean;
+  effectiveGasActive: boolean;
+} {
+  const isBraking = input.keyBackward || input.touchBrake;
+  // Touch Nitro or Auto-Gas automatically engages forward throttle when not actively braking
+  const effectiveGasActive =
+    input.keyForward ||
+    input.touchGas ||
+    (!isBraking && (input.autoGasEnabled || input.touchNitro));
+
+  const throttle = (effectiveGasActive ? 1 : 0) - (isBraking ? 1 : 0);
+  const digitalSteer =
+    (input.keyLeft || input.touchLeft ? 1 : 0) -
+    (input.keyRight || input.touchRight ? 1 : 0);
+  const steerInput =
+    Math.abs(input.touchSteerAnalog) > 0.01 ? input.touchSteerAnalog : digitalSteer;
+  const handbrake = input.keyHandbrake || input.touchDrift;
+  const isBoosting = (input.keyNitro || input.touchNitro) && input.nitroCharge > 0.05 && !isBraking;
+
+  return {
+    throttle,
+    steerInput,
+    handbrake,
+    isBoosting,
+    effectiveGasActive,
   };
 }
 

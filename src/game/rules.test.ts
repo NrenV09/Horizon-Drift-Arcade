@@ -4,6 +4,7 @@ import {
   CAR_CATALOG,
   CAR_ORDER,
   computeAnalogSteerFromPad,
+  computeEffectiveTouchDriveInput,
   computeFourWheelSurfacePose,
   computeSafeNitroImpulse,
   computeSceneExposureProfile,
@@ -145,19 +146,72 @@ test('Horizon skill chain accumulates drift, speed demon, near miss, and kangaro
   assert.equal(state.multiplier, 1.0);
 });
 
-test('analog touch steering pad maps horizontal touch coordinates to proportional steering', () => {
+test('analog touch steering pad maps horizontal touch coordinates to proportional steering, wheel degrees, and zones', () => {
   const centerTouch = computeAnalogSteerFromPad(120, 20, 200);
   assert.equal(centerTouch.steerInput, 0);
   assert.equal(centerTouch.thumbOffsetPx, 0);
+  assert.equal(centerTouch.steerDegrees, 0);
+  assert.equal(centerTouch.zone, 'center');
 
   const leftTouch = computeAnalogSteerFromPad(30, 20, 200);
   assert.equal(leftTouch.steerInput, 1);
   assert.ok(leftTouch.thumbOffsetPx < -45);
   assert.equal(leftTouch.ariaValueNow, -100);
+  assert.equal(leftTouch.steerDegrees, -45);
+  assert.equal(leftTouch.zone, 'left');
 
   const halfRightTouch = computeAnalogSteerFromPad(162, 20, 200);
   assert.ok(halfRightTouch.steerInput < -0.35 && halfRightTouch.steerInput > -0.65);
   assert.ok(halfRightTouch.thumbOffsetPx > 20);
+  assert.ok(halfRightTouch.steerDegrees > 15);
+  assert.equal(halfRightTouch.zone, 'right');
+});
+
+test('effective touch drive input supports Auto-Gas cruise, Brake override, and Nitro auto-throttle', () => {
+  const baseInput = {
+    keyForward: false,
+    keyBackward: false,
+    keyLeft: false,
+    keyRight: false,
+    keyHandbrake: false,
+    keyNitro: false,
+    touchGas: false,
+    touchBrake: false,
+    touchLeft: false,
+    touchRight: false,
+    touchSteerAnalog: 0,
+    touchDrift: false,
+    touchNitro: false,
+    autoGasEnabled: false,
+    nitroCharge: 1.0,
+  };
+
+  // Auto-gas enabled applies full throttle automatically
+  const autoGasDrive = computeEffectiveTouchDriveInput({
+    ...baseInput,
+    autoGasEnabled: true,
+    touchSteerAnalog: 0.42,
+  });
+  assert.equal(autoGasDrive.throttle, 1);
+  assert.equal(autoGasDrive.effectiveGasActive, true);
+  assert.equal(autoGasDrive.steerInput, 0.42);
+
+  // Pressing Brake while Auto-Gas is on overrides throttle to -1 (brake/reverse)
+  const brakeOverride = computeEffectiveTouchDriveInput({
+    ...baseInput,
+    autoGasEnabled: true,
+    touchBrake: true,
+  });
+  assert.equal(brakeOverride.throttle, -1);
+  assert.equal(brakeOverride.effectiveGasActive, false);
+
+  // Pressing Touch Nitro alone automatically engages forward throttle + boost
+  const nitroTouch = computeEffectiveTouchDriveInput({
+    ...baseInput,
+    touchNitro: true,
+  });
+  assert.equal(nitroTouch.throttle, 1);
+  assert.equal(nitroTouch.isBoosting, true);
 });
 
 test('scene exposure profile keeps ACESFilmic exposure and bloom calibrated against overexposure', () => {
