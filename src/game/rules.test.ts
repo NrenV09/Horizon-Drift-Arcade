@@ -8,18 +8,24 @@ import {
   computeFourWheelSurfacePose,
   computeSafeNitroImpulse,
   computeSceneExposureProfile,
+  computeSurfacePhysicsProfile,
   computeTerrainHeight,
   computeVehicleTelemetry,
+  createInitialChaseCameraState,
   createInitialSkillState,
   getCarSpec,
   getHighwayPointAtAngle,
   getRoadDistanceInfo,
   getScenerySpec,
   getTimeOfDayLightingProfile,
+  resolveMapColliderImpact,
   ROAD_HALF_WIDTH,
   SCENERY_CATALOG,
   SCENERY_ORDER,
+  stepAutomotiveHorizontalPhysics,
+  stepChaseCameraRelative,
   stepSkillChain,
+  stepVerticalGroundPhysics,
 } from './rules.ts';
 
 test('world origin (0, 0) sits directly on the highway centerline at ground level', () => {
@@ -303,4 +309,248 @@ test('scenery catalog defines 3 distinct festival worlds (Red Rock Canyon, Alpin
   }
   assert.equal(getScenerySpec('unknown').id, 'canyon');
 });
+
+test('high-speed (200-340 km/h) vertical ground physics stays 100% planted on highway slopes without false airborne oscillation', () => {
+  let isGrounded = true;
+  let y = 0.56;
+  let vy = 0;
+  let slopeRate = 0;
+  const dt = 1 / 60;
+
+  // Simulate 180 frames at 240 km/h (66.7 m/s) climbing a 7.5% highway grade (slopeRate = +5.0 m/s > 3.5 m/s)
+  for (let i = 0; i < 180; i++) {
+    const prevGroundY = y;
+    const targetGroundY = prevGroundY + 5.0 * dt;
+    const step = stepVerticalGroundPhysics({
+      wasGrounded: isGrounded,
+      currentY: y,
+      currentVy: vy,
+      prevGroundY,
+      targetGroundY,
+      prevSlopeRate: slopeRate,
+      kmh: 240,
+      isOffroad: false,
+      dt,
+    });
+    isGrounded = step.isGrounded;
+    y = step.y;
+    vy = step.vy;
+    slopeRate = step.slopeRate;
+    assert.equal(isGrounded, true, `Car falsely detached on uphill highway at frame ${i}`);
+    assert.equal(y, targetGroundY);
+  }
+
+  // Simulate sharp off-road dune crest at 210 km/h -> should cleanly launch and then land
+  const launchStep = stepVerticalGroundPhysics({
+    wasGrounded: true,
+    currentY: 14.0,
+    currentVy: 6.5,
+    prevGroundY: 14.0,
+    targetGroundY: 13.8, // Sudden downward slope (-12 m/s) after +6.5 m/s climb
+    prevSlopeRate: 6.5,
+    kmh: 210,
+    isOffroad: true,
+    dt,
+  });
+  assert.equal(launchStep.isGrounded, false, 'Expected car to launch off sharp off-road dune crest at 210 km/h');
+  assert.ok(launchStep.y > 13.8);
+});
+
+test('car-relative chase camera maintains steady follow distance at 200-300 km/h across fluctuating frame times without rubber-banding', () => {
+  let camState = createInitialChaseCameraState(0, -1);
+  let carZ = 0;
+  const carX = 0;
+  const carY = 0.56;
+  const speedMs = 250 / 3.6; // ~69.44 m/s (250 km/h)
+
+  // Vary dt aggressively between 8ms, 16.6ms, 33.3ms, and 45ms to simulate frame-time jitter at 250 km/h
+  const frameDts = [0.016, 0.033, 0.008, 0.042, 0.016, 0.028, 0.012, 0.038];
+  const distances: number[] = [];
+
+  for (let i = 0; i < 40; i++) {
+    const dt = frameDts[i % frameDts.length];
+    carZ -= speedMs * dt;
+    const res = stepChaseCameraRelative(camState, {
+      carX,
+      carY,
+      carZ,
+      carFwdX: 0,
+      carFwdZ: -1,
+      visualYawOffset: 0,
+      kmh: 250,
+      throttle: 1,
+      isBoosting: true,
+      isTitan: false,
+      dt,
+    });
+    camState = res.state;
+    const distToCar = Math.hypot(res.camX - carX, res.camZ - carZ);
+    distances.push(distToCar);
+    // Distance must always remain tightly bounded between 6.4m and 7.5m (never lagging 11-13m behind)
+    assert.ok(
+      distToCar >= 6.39 && distToCar <= 7.5,
+      `Expected camera distance in [6.4, 7.5], got ${distToCar} at step ${i}`,
+    );
+  }
+
+  // Once settled, frame-to-frame distance variation under heavy dt jitter is near zero (< 0.02m)
+  const settledDiff = Math.abs(distances[distances.length - 1] - distances[distances.length - 2]);
+  assert.ok(settledDiff < 0.02, `Expected zero camera rubber-banding at 250 km/h, got diff=${settledDiff}`);
+});
+
+test('surface physics profile differentiates asphalt, dirt, alpine snow, and Oasis water with Titan 4x4 off-road advantage', () => {
+  const asphalt = computeSurfacePhysicsProfile({
+    groundY: 0,
+    roadDistance: 4,
+    carId: 'apex',
+    sceneryId: 'canyon',
+  });
+  assert.equal(asphalt.surface, 'asphalt');
+  assert.ok(asphalt.gripMu > 1.0);
+  assert.equal(asphalt.waterDragCoeff, 0);
+
+  const snowApex = computeSurfacePhysicsProfile({
+    groundY: 12,
+    roadDistance: 35,
+    carId: 'apex',
+    sceneryId: 'alpine',
+  });
+  const snowTitan = computeSurfacePhysicsProfile({
+    groundY: 12,
+    roadDistance: 35,
+    carId: 'titan',
+    sceneryId: 'alpine',
+  });
+  assert.equal(snowApex.surface, 'snow');
+  assert.ok(snowTitan.gripMu > snowApex.gripMu, 'Titan 4x4 should have superior snow grip');
+
+  const oasisWater = computeSurfacePhysicsProfile({
+    groundY: -12.6,
+    roadDistance: 95,
+    carId: 'kaze',
+    sceneryId: 'canyon',
+  });
+  assert.equal(oasisWater.surface, 'water');
+  assert.ok(oasisWater.waterDepth > 0.8);
+  assert.ok(oasisWater.waterDragCoeff > 0.4);
+});
+
+test('real automotive horizontal physics applies slope gravity, trail-braking turn-in, and counter-steer drift dynamics', () => {
+  const apex = getCarSpec('apex');
+  const asphalt = computeSurfacePhysicsProfile({
+    groundY: 0,
+    roadDistance: 0,
+    carId: 'apex',
+    sceneryId: 'canyon',
+  });
+
+  // Uphill climb (+0.22 rad pitch) should produce lower longitudinal speed gain than downhill (-0.22 rad pitch)
+  const uphill = stepAutomotiveHorizontalPhysics({
+    vx: 0,
+    vz: -35,
+    yaw: 0,
+    yawRate: 0,
+    visualYawOffset: 0,
+    steerAngle: 0,
+    throttle: 1,
+    handbrake: false,
+    isGrounded: true,
+    terrainPitch: 0.22,
+    terrainRoll: 0,
+    carSpec: apex,
+    surfaceProfile: asphalt,
+    dt: 1 / 60,
+  });
+  const downhill = stepAutomotiveHorizontalPhysics({
+    vx: 0,
+    vz: -35,
+    yaw: 0,
+    yawRate: 0,
+    visualYawOffset: 0,
+    steerAngle: 0,
+    throttle: 1,
+    handbrake: false,
+    isGrounded: true,
+    terrainPitch: -0.22,
+    terrainRoll: 0,
+    carSpec: apex,
+    surfaceProfile: asphalt,
+    dt: 1 / 60,
+  });
+  assert.ok(downhill.vLong > uphill.vLong, 'Downhill slope gravity must accelerate faster than uphill climb');
+
+  // Trail-braking (throttle < 0) shifts weight forward and increases turn-in yaw rate vs full-throttle understeer
+  const brakeTurn = stepAutomotiveHorizontalPhysics({
+    vx: 0,
+    vz: -40,
+    yaw: 0,
+    yawRate: 0,
+    visualYawOffset: 0,
+    steerAngle: 0.35,
+    throttle: -1,
+    handbrake: false,
+    isGrounded: true,
+    terrainPitch: 0,
+    terrainRoll: 0,
+    carSpec: apex,
+    surfaceProfile: asphalt,
+    dt: 1 / 60,
+  });
+  const accelTurn = stepAutomotiveHorizontalPhysics({
+    vx: 0,
+    vz: -40,
+    yaw: 0,
+    yawRate: 0,
+    visualYawOffset: 0,
+    steerAngle: 0.35,
+    throttle: 1,
+    handbrake: false,
+    isGrounded: true,
+    terrainPitch: 0,
+    terrainRoll: 0,
+    carSpec: apex,
+    surfaceProfile: asphalt,
+    dt: 1 / 60,
+  });
+  assert.ok(Math.abs(brakeTurn.yawRate) > Math.abs(accelTurn.yawRate), 'Front weight shift under braking should increase turn-in yaw rate');
+});
+
+test('map collider impact solver resolves rigid boulder rebounds and launches smashable props airborne', () => {
+  // 1) Rigid boulder head-on impact at 180 km/h (50 m/s along -Z)
+  const rigidHit = resolveMapColliderImpact({
+    carX: 0.4,
+    carZ: 2.0,
+    carVx: 0,
+    carVz: -50,
+    carYaw: 0,
+    carRadius: 1.4,
+    colX: 0,
+    colZ: 0,
+    colRadius: 1.8,
+    kind: 'rigid',
+  });
+  assert.equal(rigidHit.collided, true);
+  assert.ok(rigidHit.carZ > 2.0, 'Car should be pushed out of penetration');
+  assert.ok(rigidHit.carVz > -10, 'Normal velocity into rigid boulder must rebound/arrest');
+  assert.ok(rigidHit.impactSpeedKmh > 120);
+
+  // 2) Smashable highway bollard impact at 144 km/h (40 m/s along -Z)
+  const smashHit = resolveMapColliderImpact({
+    carX: 0,
+    carZ: 1.0,
+    carVx: 0,
+    carVz: -40,
+    carYaw: 0,
+    carRadius: 1.3,
+    colX: 0,
+    colZ: 0,
+    colRadius: 0.5,
+    kind: 'smashable',
+  });
+  assert.equal(smashHit.collided, true);
+  assert.ok(smashHit.carVz < -38, 'Smashing a bollard should preserve 98% of forward speed');
+  assert.ok(smashHit.propLaunchVy > 8, 'Smashed bollard should launch airborne');
+  assert.ok(smashHit.propLaunchVz < -35, 'Smashed bollard should fly forward ahead of the car');
+});
+
 

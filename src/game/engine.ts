@@ -15,17 +15,25 @@ import {
   computeAnalogSteerFromPad,
   computeEffectiveTouchDriveInput,
   computeSafeNitroImpulse,
+  computeSurfacePhysicsProfile,
   computeTerrainHeight,
+  createInitialChaseCameraState,
   getCarSpec,
+  getHighwayElevationAtAngle,
   getHighwayPointAtAngle,
   getRoadDistanceInfo,
   getScenerySpec,
+  resolveMapColliderImpact,
   ROAD_HALF_WIDTH,
   SCENERY_CATALOG,
   SCENERY_ORDER,
   SceneryId,
   ScenerySpec,
   smoothstep,
+  stepAutomotiveHorizontalPhysics,
+  stepChaseCameraRelative,
+  stepVerticalGroundPhysics,
+  SurfacePhysicsProfile,
   TimeOfDayMode,
 } from './rules';
 
@@ -170,28 +178,58 @@ class SoundEngine {
     }
   }
 
-  update(rpmNorm: number, throttle: number, isDrifting: boolean, isPlaying: boolean, kmh = 0, baseHz = 54) {
+  isResuming = false;
+  curFreq = 60;
+  curFilterFreq = 450;
+  curEngineGain = 0.0001;
+  curTireGain = 0.0001;
+
+  update(
+    rpmNorm: number,
+    throttle: number,
+    isDrifting: boolean,
+    isPlaying: boolean,
+    kmh = 0,
+    baseHz = 54,
+    dt = 0.016,
+  ) {
     if (!this.ctx || !this.engineGain || !this.engineOsc1 || !this.engineOsc2) return;
     if (this.muted || !isPlaying) {
-      this.engineGain.gain.setTargetAtTime(0.0001, this.ctx.currentTime, 0.08);
-      if (this.tireGain) this.tireGain.gain.setTargetAtTime(0.0001, this.ctx.currentTime, 0.08);
+      this.curEngineGain = THREE.MathUtils.damp(this.curEngineGain, 0.0001, 14, dt);
+      this.curTireGain = THREE.MathUtils.damp(this.curTireGain, 0.0001, 14, dt);
+      this.engineGain.gain.value = this.curEngineGain;
+      if (this.tireGain) this.tireGain.gain.value = this.curTireGain;
       return;
     }
-    if (this.ctx.state === 'suspended') {
-      this.ctx.resume().catch(() => {});
+    if (this.ctx.state === 'suspended' && !this.isResuming) {
+      this.isResuming = true;
+      this.ctx
+        .resume()
+        .catch(() => {})
+        .finally(() => {
+          this.isResuming = false;
+        });
     }
-    const freq = baseHz + rpmNorm * 165;
-    this.engineOsc1.frequency.setTargetAtTime(freq, this.ctx.currentTime, 0.04);
-    this.engineOsc2.frequency.setTargetAtTime(freq * 1.5, this.ctx.currentTime, 0.04);
+    const targetFreq = baseHz + rpmNorm * 165;
+    this.curFreq = THREE.MathUtils.damp(this.curFreq, targetFreq, 20, dt);
+    this.engineOsc1.frequency.value = this.curFreq;
+    this.engineOsc2.frequency.value = this.curFreq * 1.5;
+
     if (this.engineFilter) {
-      this.engineFilter.frequency.setTargetAtTime(440 + rpmNorm * 980, this.ctx.currentTime, 0.05);
+      const targetFilter = 440 + rpmNorm * 980;
+      this.curFilterFreq = THREE.MathUtils.damp(this.curFilterFreq, targetFilter, 18, dt);
+      this.engineFilter.frequency.value = this.curFilterFreq;
     }
-    const gainVal = 0.038 + Math.abs(throttle) * 0.045 + (isDrifting ? 0.02 : 0);
-    this.engineGain.gain.setTargetAtTime(gainVal, this.ctx.currentTime, 0.06);
+
+    const targetGain = 0.038 + Math.abs(throttle) * 0.045 + (isDrifting ? 0.02 : 0);
+    this.curEngineGain = THREE.MathUtils.damp(this.curEngineGain, targetGain, 16, dt);
+    this.engineGain.gain.value = this.curEngineGain;
+
     if (this.tireGain) {
       const screech = isDrifting && kmh > 14;
-      const tireVal = screech ? Math.min(0.055, 0.02 + (kmh / 200) * 0.035) : 0.0001;
-      this.tireGain.gain.setTargetAtTime(tireVal, this.ctx.currentTime, screech ? 0.04 : 0.1);
+      const targetTire = screech ? Math.min(0.055, 0.02 + (kmh / 200) * 0.035) : 0.0001;
+      this.curTireGain = THREE.MathUtils.damp(this.curTireGain, targetTire, screech ? 22 : 12, dt);
+      this.tireGain.gain.value = this.curTireGain;
     }
   }
 
@@ -347,7 +385,10 @@ const composer = new EffectComposer(renderer);
 const renderPass = new RenderPass(scene, camera);
 composer.addPass(renderPass);
 const bloomPass = new UnrealBloomPass(
-  new THREE.Vector2(window.innerWidth, window.innerHeight),
+  new THREE.Vector2(
+    Math.max(1, Math.floor(window.innerWidth * 0.5)),
+    Math.max(1, Math.floor(window.innerHeight * 0.5)),
+  ),
   0.16,
   0.25,
   2.6,
@@ -750,6 +791,114 @@ for (let i = 0; i < 4; i++) {
   searchlights.push(beam);
 }
 
+// ============================================================================
+// SPATIAL COLLIDER GRID FOR REAL MAP PHYSICS (Rigid Obstacles & Smashables)
+// ============================================================================
+const COLLIDER_CELL_SIZE = 28;
+interface RigidMapCollider {
+  x: number;
+  z: number;
+  radius: number;
+  sparkColorHex: number;
+}
+interface SmashableMapProp {
+  id: number;
+  meshKind: 'bollard' | 'flag' | 'sapling';
+  instanceIdx: number;
+  homeX: number;
+  homeY: number;
+  homeZ: number;
+  homeYaw: number;
+  scale: number;
+  radius: number;
+  debrisColorHex: number;
+  smashed: boolean;
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  rx: number;
+  ry: number;
+  rz: number;
+  avx: number;
+  avy: number;
+  avz: number;
+  smashedAge: number;
+}
+
+const rigidGrid = new Map<number, RigidMapCollider[]>();
+const smashableGrid = new Map<number, SmashableMapProp[]>();
+const activeFlyingProps: SmashableMapProp[] = [];
+let nextSmashableId = 1;
+
+function getGridCellKey(x: number, z: number): number {
+  const cx = Math.floor(x / COLLIDER_CELL_SIZE) + 500;
+  const cz = Math.floor(z / COLLIDER_CELL_SIZE) + 500;
+  return (cx << 12) | (cz & 0xfff);
+}
+
+function registerRigidCollider(x: number, z: number, radius: number, sparkColorHex = 0xffaa3b) {
+  const key = getGridCellKey(x, z);
+  let bucket = rigidGrid.get(key);
+  if (!bucket) {
+    bucket = [];
+    rigidGrid.set(key, bucket);
+  }
+  bucket.push({ x, z, radius, sparkColorHex });
+}
+
+function registerSmashableProp(
+  meshKind: 'bollard' | 'flag' | 'sapling',
+  instanceIdx: number,
+  x: number,
+  y: number,
+  z: number,
+  yaw: number,
+  scale: number,
+  radius: number,
+  debrisColorHex: number,
+) {
+  const prop: SmashableMapProp = {
+    id: nextSmashableId++,
+    meshKind,
+    instanceIdx,
+    homeX: x,
+    homeY: y,
+    homeZ: z,
+    homeYaw: yaw,
+    scale,
+    radius,
+    debrisColorHex,
+    smashed: false,
+    x,
+    y,
+    z,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    rx: 0,
+    ry: yaw,
+    rz: 0,
+    avx: 0,
+    avy: 0,
+    avz: 0,
+    smashedAge: 0,
+  };
+  const key = getGridCellKey(x, z);
+  let bucket = smashableGrid.get(key);
+  if (!bucket) {
+    bucket = [];
+    smashableGrid.set(key, bucket);
+  }
+  bucket.push(prop);
+}
+
+// Register Ferris Wheel & Festival Stage bases as rigid colliders
+registerRigidCollider(ferrisX, ferrisZ, 9.2, 0x00f0ff);
+registerRigidCollider(stageX, stageZ, 10.5, 0xff2a85);
+
 // Landmark 3: Cable-Stayed Highway Bridge Towers
 const bridgeAngles = [0.68, 0.92];
 const pylonMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.35, metalness: 0.65 });
@@ -770,6 +919,9 @@ bridgeAngles.forEach((theta) => {
   pLeft.position.x = -span;
   const pRight = new THREE.Mesh(pylonGeo, pylonMat);
   pRight.position.x = span;
+  // Register both bridge pylons in world space
+  registerRigidCollider(pt.x - pt.nx * span, pt.z - pt.nz * span, 1.85, 0xe2e8f0);
+  registerRigidCollider(pt.x + pt.nx * span, pt.z + pt.nz * span, 1.85, 0xe2e8f0);
   const beamTop = new THREE.Mesh(crossBeamGeo, pylonMat);
   beamTop.position.y = 44;
   const beamMid = new THREE.Mesh(crossBeamGeo, neonPinkMat);
@@ -842,6 +994,10 @@ const archMat = new THREE.MeshStandardMaterial({ color: 0xa8462a, roughness: 0.8
   archMesh.scale.set(1.15, 0.95, 1.8);
   archGroup.add(archMesh);
   scene.add(archGroup);
+  // Register archway rock base pillars on both sides of the highway
+  const archSpan = 22.5 * 1.15;
+  registerRigidCollider(pt.x - pt.nx * archSpan, pt.z - pt.nz * archSpan, 3.8, 0xd97736);
+  registerRigidCollider(pt.x + pt.nx * archSpan, pt.z + pt.nz * archSpan, 3.8, 0xd97736);
 });
 
 // Instanced Trees (1,500 Composite 4-Part Trees)
@@ -883,14 +1039,21 @@ for (let attempts = 0; placedTrees < TREE_COUNT && attempts < 12000; attempts++)
   if (distance < 23 || Math.hypot(tx - OASIS_X, tz - OASIS_Z) < 158) continue;
   const ty = getTerrainY(tx, tz);
   const scale = 0.85 + rng() * 0.85;
+  const treeYaw = rng() * Math.PI * 2;
   _dummy.position.set(tx, ty - 0.15, tz);
-  _dummy.rotation.set(0, rng() * Math.PI * 2, 0);
+  _dummy.rotation.set(0, treeYaw, 0);
   _dummy.scale.setScalar(scale);
   _dummy.updateMatrix();
   treeTrunkInst.setMatrixAt(placedTrees, _dummy.matrix);
   treeCone1.setMatrixAt(placedTrees, _dummy.matrix);
   treeCone2.setMatrixAt(placedTrees, _dummy.matrix);
   treeCone3.setMatrixAt(placedTrees, _dummy.matrix);
+  // Small saplings (< 1.18 scale) are destructible Forza Horizon "LANDSCAPING" smashables; large trees are rigid trunks
+  if (scale < 1.18) {
+    registerSmashableProp('sapling', placedTrees, tx, ty - 0.15, tz, treeYaw, scale, 0.65 * scale, 0x3f7a2e);
+  } else {
+    registerRigidCollider(tx, tz, 0.56 * scale, 0x8f5e26);
+  }
   placedTrees++;
 }
 treeTrunkInst.instanceMatrix.needsUpdate = true;
@@ -935,20 +1098,20 @@ for (let attempts = 0; placedRocks < ROCK_COUNT && attempts < 9000; attempts++) 
   _dummy.position.set(rx, ry - 0.35, rz);
   _dummy.rotation.set(rng() * 0.4, rng() * Math.PI * 2, rng() * 0.4);
   const spire = placedRocks % 9 === 0 ? 3.4 : 1;
-  _dummy.scale.set(
-    (0.8 + rng() * 2.2) * (spire > 1 ? 1.8 : 1),
-    (0.6 + rng() * 1.6) * spire,
-    (0.8 + rng() * 2.2) * (spire > 1 ? 1.8 : 1),
-  );
+  const sx = (0.8 + rng() * 2.2) * (spire > 1 ? 1.8 : 1);
+  const sy = (0.6 + rng() * 1.6) * spire;
+  const sz = (0.8 + rng() * 2.2) * (spire > 1 ? 1.8 : 1);
+  _dummy.scale.set(sx, sy, sz);
   _dummy.updateMatrix();
   rockInst.setMatrixAt(placedRocks, _dummy.matrix);
+  registerRigidCollider(rx, rz, Math.min(4.8, (sx + sz) * 0.68), 0xffaa3b);
   placedRocks++;
 }
 rockInst.instanceMatrix.needsUpdate = true;
 rockInst.computeBoundingSphere();
 scene.add(rockInst);
 
-// Highway Bollards & Festival Flags
+// Highway Bollards & Festival Flags (Destructible Forza Horizon Smashables!)
 const BOLLARD_PAIRS = 120;
 const bollardGeo = new THREE.BoxGeometry(0.28, 1.25, 0.28);
 bollardGeo.translate(0, 0.62, 0);
@@ -980,11 +1143,17 @@ for (let i = 0; i < BOLLARD_PAIRS; i++) {
   _dummy.scale.setScalar(1);
   _dummy.updateMatrix();
   bollardInst.setMatrixAt(i * 2, _dummy.matrix);
-  _dummy.position.set(pt.x - pt.nx * 15.95, ly, pt.z - pt.nz * 15.95);
+  registerSmashableProp('bollard', i * 2, lx, ly, lz, yaw, 1, 0.55, 0xff8a2b);
+
+  const flx = pt.x - pt.nx * 15.95;
+  const flz = pt.z - pt.nz * 15.95;
+  _dummy.position.set(flx, ly, flz);
   _dummy.updateMatrix();
   flagInst.setMatrixAt(i * 2, _dummy.matrix);
-  _instColor.setHex(flagPalette[i % flagPalette.length]);
+  const fColL = flagPalette[i % flagPalette.length];
+  _instColor.setHex(fColL);
   flagInst.setColorAt(i * 2, _instColor);
+  registerSmashableProp('flag', i * 2, flx, ly, flz, yaw, 1, 0.65, fColL);
 
   const rx = pt.x + pt.nx * offset;
   const rz = pt.z + pt.nz * offset;
@@ -992,11 +1161,17 @@ for (let i = 0; i < BOLLARD_PAIRS; i++) {
   _dummy.position.set(rx, ry, rz);
   _dummy.updateMatrix();
   bollardInst.setMatrixAt(i * 2 + 1, _dummy.matrix);
-  _dummy.position.set(pt.x + pt.nx * 15.95, ry, pt.z + pt.nz * 15.95);
+  registerSmashableProp('bollard', i * 2 + 1, rx, ry, rz, yaw, 1, 0.55, 0xff8a2b);
+
+  const frx = pt.x + pt.nx * 15.95;
+  const frz = pt.z + pt.nz * 15.95;
+  _dummy.position.set(frx, ry, frz);
   _dummy.updateMatrix();
   flagInst.setMatrixAt(i * 2 + 1, _dummy.matrix);
-  _instColor.setHex(flagPalette[(i + 1) % flagPalette.length]);
+  const fColR = flagPalette[(i + 1) % flagPalette.length];
+  _instColor.setHex(fColR);
   flagInst.setColorAt(i * 2 + 1, _instColor);
+  registerSmashableProp('flag', i * 2 + 1, frx, ry, frz, yaw, 1, 0.65, fColR);
 }
 bollardInst.instanceMatrix.needsUpdate = true;
 flagInst.instanceMatrix.needsUpdate = true;
@@ -1046,6 +1221,7 @@ for (let i = 0; i < GATE_COUNT; i++) {
   _dummy.updateMatrix();
   gatePillarInst.setMatrixAt(i * 2, _dummy.matrix);
   gateSleeveInst.setMatrixAt(i * 2, _dummy.matrix);
+  registerRigidCollider(lx, lz, 0.72, 0x00f0ff);
 
   const rx = pt.x + pt.nx * 15;
   const rz = pt.z + pt.nz * 15;
@@ -1053,6 +1229,7 @@ for (let i = 0; i < GATE_COUNT; i++) {
   _dummy.updateMatrix();
   gatePillarInst.setMatrixAt(i * 2 + 1, _dummy.matrix);
   gateSleeveInst.setMatrixAt(i * 2 + 1, _dummy.matrix);
+  registerRigidCollider(rx, rz, 0.72, 0x00f0ff);
 
   _dummy.position.set(pt.x, y, pt.z);
   _dummy.rotation.set(0, yaw, 0);
@@ -1363,8 +1540,11 @@ const rivals: Array<{
   mesh: THREE.Group;
   theta: number;
   angularSpeed: number;
+  baseLaneOffset: number;
   laneOffset: number;
+  lateralVel: number;
   nearMissCooldown: number;
+  hitCooldown: number;
 }> = [];
 const rivalColors = [0x00f0ff, 0xfacc15, 0xa3e635, 0xec4899, 0x38bdf8, 0xf97316];
 
@@ -1388,12 +1568,16 @@ for (let i = 0; i < 6; i++) {
   shad.position.y = 0.04;
   rGroup.add(body, cabin, tail, head, shad);
   scene.add(rGroup);
+  const baseLane = i % 2 === 0 ? 5.6 : -5.6;
   rivals.push({
     mesh: rGroup,
     theta: ((i + 0.5) / 6) * Math.PI * 2,
     angularSpeed: (i % 2 === 0 ? 1 : -1) * (0.048 + (i % 3) * 0.008),
-    laneOffset: i % 2 === 0 ? 5.6 : -5.6,
+    baseLaneOffset: baseLane,
+    laneOffset: baseLane,
+    lateralVel: 0,
     nearMissCooldown: 0,
+    hitCooldown: 0,
   });
 }
 
@@ -1414,12 +1598,15 @@ const carState = {
   vy: 0,
   vz: 0,
   yaw: 0,
+  yawRate: 0,
   visualYawOffset: 0,
   pitch: 0,
   roll: 0,
   wheelSpin: 0,
   suspensionBounce: 0,
   suspensionVel: 0,
+  isGrounded: true,
+  slopeRate: 0,
 };
 
 const MAX_PARTICLES = 180;
@@ -1446,6 +1633,7 @@ const particles = Array.from({ length: MAX_PARTICLES }, () => ({
   colorHex: 0xdbeafe,
 }));
 let particleCursor = 0;
+let particleColorsDirty = false;
 
 function spawnParticle(
   x: number,
@@ -1459,7 +1647,8 @@ function spawnParticle(
   maxAge: number,
   colorHex: number,
 ) {
-  const p = particles[particleCursor];
+  const idx = particleCursor;
+  const p = particles[idx];
   particleCursor = (particleCursor + 1) % MAX_PARTICLES;
   p.active = true;
   p.x = x;
@@ -1473,6 +1662,9 @@ function spawnParticle(
   p.age = 0;
   p.maxAge = maxAge;
   p.colorHex = colorHex;
+  _instColor.setHex(colorHex);
+  particleInst.setColorAt(idx, _instColor);
+  particleColorsDirty = true;
 }
 
 const MAX_SKIDS = 220;
@@ -1594,13 +1786,21 @@ const hudSpeedEl = document.getElementById('hud-speed')!;
 const hudGearEl = document.getElementById('hud-gear')!;
 const hudGearBoxEl = document.getElementById('hud-gear-box')!;
 const hudRpmBarEl = document.getElementById('hud-rpm-bar')!;
+const hudRpmArcEl = document.getElementById('hud-rpm-arc');
 const hudRpmTextEl = document.getElementById('hud-rpm-text')!;
 const hudNitroBarEl = document.getElementById('hud-nitro-bar')!;
+const hudNitroArcEl = document.getElementById('hud-nitro-arc');
 const hudUnitToggleEl = document.getElementById('hud-unit-toggle')!;
 const hudBankedXpEl = document.getElementById('hud-banked-xp')!;
 const hudGatesCountEl = document.getElementById('hud-gates-count')!;
 const hudBestChainEl = document.getElementById('hud-best-chain')!;
 const hudCarWorldLabelEl = document.getElementById('hud-car-world-label');
+const menuPiClassEl = document.getElementById('menu-pi-class');
+const menuPiNumEl = document.getElementById('menu-pi-num');
+const specPiClassEl = document.getElementById('spec-pi-class');
+const specPiNumEl = document.getElementById('spec-pi-num');
+const hudPiClassEl = document.getElementById('hud-pi-class');
+const hudPiNumEl = document.getElementById('hud-pi-num');
 const skillChainCardEl = document.getElementById('skill-chain-card')!;
 const hudSkillPointsEl = document.getElementById('hud-skill-points')!;
 const hudSkillMultEl = document.getElementById('hud-skill-mult')!;
@@ -1787,7 +1987,7 @@ function cycleTimeOfDay() {
 // ============================================================================
 function updateHudCarWorldBanner() {
   if (hudCarWorldLabelEl) {
-    hudCarWorldLabelEl.textContent = `${currentCarSpec.name} · ${currentScenerySpec.name}`;
+    hudCarWorldLabelEl.textContent = `${currentCarSpec.name.toUpperCase()} · ${currentScenerySpec.name.toUpperCase()}`;
   }
 }
 
@@ -1818,17 +2018,30 @@ function selectCar(carId: CarId, applyDefaultPaintColor = true) {
     btn.setAttribute('aria-pressed', String(isSelected));
   });
 
-  // Update Main Menu performance telemetry bars
+  // Update Forza Horizon Performance Index (PI) Badges
+  const piClass = carId === 'kaze' ? 'A' : 'S1';
+  const piNum = carId === 'apex' ? '900' : carId === 'kaze' ? '800' : '880';
+  [menuPiClassEl, specPiClassEl, hudPiClassEl].forEach((el) => {
+    if (el) {
+      el.textContent = piClass;
+      el.dataset.class = piClass;
+    }
+  });
+  [menuPiNumEl, specPiNumEl, hudPiNumEl].forEach((el) => {
+    if (el) el.textContent = piNum;
+  });
+
+  // Update Main Menu Forza 0.0-10.0 performance telemetry bars
   if (statBarSpeedEl) statBarSpeedEl.style.width = `${currentCarSpec.stats.speed}%`;
-  if (statValSpeedEl) statValSpeedEl.textContent = `${currentCarSpec.maxNitroKmh} KMH`;
+  if (statValSpeedEl) statValSpeedEl.textContent = (currentCarSpec.stats.speed / 10).toFixed(1);
   if (statBarHandlingEl) statBarHandlingEl.style.width = `${currentCarSpec.stats.handling}%`;
-  if (statValHandlingEl) statValHandlingEl.textContent = `${currentCarSpec.stats.handling}`;
+  if (statValHandlingEl) statValHandlingEl.textContent = (currentCarSpec.stats.handling / 10).toFixed(1);
   if (statBarDriftEl) statBarDriftEl.style.width = `${currentCarSpec.stats.drift}%`;
-  if (statValDriftEl) statValDriftEl.textContent = `${currentCarSpec.stats.drift}`;
+  if (statValDriftEl) statValDriftEl.textContent = (currentCarSpec.stats.drift / 10).toFixed(1);
   if (statBarOffroadEl) statBarOffroadEl.style.width = `${currentCarSpec.stats.offroad}%`;
-  if (statValOffroadEl) statValOffroadEl.textContent = `${currentCarSpec.stats.offroad}`;
+  if (statValOffroadEl) statValOffroadEl.textContent = (currentCarSpec.stats.offroad / 10).toFixed(1);
   if (menuActiveCarSummaryEl) {
-    menuActiveCarSummaryEl.textContent = `${currentCarSpec.name} — ${currentCarSpec.subtitle}`;
+    menuActiveCarSummaryEl.textContent = currentCarSpec.name.toUpperCase();
   }
   const shortName = carId === 'apex' ? 'Apex V10' : carId === 'kaze' ? 'Kaze RX-79' : 'Titan 4x4';
   if (dockCarBtnEl) {
@@ -1842,6 +2055,8 @@ function selectCar(carId: CarId, applyDefaultPaintColor = true) {
   // Snap ride height smoothly to new car spec
   const pose = getWheelGroundPose(carState.x, carState.z, carState.yaw, currentCarSpec);
   carState.y = pose.avgGroundY + currentCarSpec.rideHeightOffset;
+  carState.isGrounded = true;
+  carState.slopeRate = 0;
 }
 
 function cycleCar() {
@@ -1903,7 +2118,7 @@ function selectScenery(sceneryId: SceneryId, syncDefaultTimeOfDay = true) {
     btn.setAttribute('aria-pressed', String(isSelected));
   });
   if (menuActiveScenerySummaryEl) {
-    menuActiveScenerySummaryEl.textContent = `${currentScenerySpec.name} — ${currentScenerySpec.subtitle}`;
+    menuActiveScenerySummaryEl.textContent = currentScenerySpec.name.toUpperCase();
   }
   const shortWorld = sceneryId === 'canyon' ? 'Canyon' : sceneryId === 'alpine' ? 'Alpine' : 'Cyber Bay';
   if (dockSceneryBtnEl) {
@@ -2023,8 +2238,8 @@ function setTouchMode(enabled: boolean) {
     touchControlsLayerEl.classList.toggle('visible', isTouchEnabled && gameState === 'playing');
   }
   if (btnTouchTopEl) {
-    btnTouchTopEl.textContent = `Touch: ${isTouchEnabled ? 'ON' : 'OFF'} [T]`;
-    btnTouchTopEl.style.borderColor = isTouchEnabled ? 'rgba(0, 240, 255, 0.75)' : '';
+    btnTouchTopEl.textContent = 'TOUCH [T]';
+    btnTouchTopEl.style.borderBottomColor = isTouchEnabled ? '#00f0ff' : '';
     btnTouchTopEl.style.color = isTouchEnabled ? '#00f0ff' : '';
   }
 }
@@ -2113,11 +2328,16 @@ function resetCarOnHighway() {
   carState.vy = 0;
   carState.vz = 0;
   carState.yaw = yaw;
+  carState.yawRate = 0;
   carState.visualYawOffset = 0;
   carState.pitch = 0;
   carState.roll = 0;
   carState.suspensionBounce = 0;
   carState.suspensionVel = 0;
+  carState.isGrounded = true;
+  carState.slopeRate = 0;
+  airTime = 0;
+  cameraTrauma = 0;
   chassisBody.position.set(carState.x, carState.y, carState.z);
 }
 
@@ -2142,6 +2362,9 @@ document.getElementById('modal-title-btn')?.addEventListener('click', () => {
 document.getElementById('btn-menu-top')?.addEventListener('click', () => {
   setGameState('title');
 });
+document.querySelector('.radar-shell')?.addEventListener('click', () => {
+  setGameState('title');
+});
 
 function toggleCameraMode() {
   cameraMode = cameraMode === 'chase' ? 'hood' : 'chase';
@@ -2154,7 +2377,7 @@ function toggleCameraMode() {
   }
   const topCamEl = document.getElementById('btn-camera-top');
   if (topCamEl) {
-    topCamEl.textContent = `Cam: ${label} [C]`;
+    topCamEl.textContent = `CAM [C]`;
   }
 }
 if (dockCamBtnEl) dockCamBtnEl.addEventListener('click', toggleCameraMode);
@@ -2452,7 +2675,13 @@ if (searchParams.get('autostart') === '1') {
   setGameState('playing');
 }
 
-// Highway Radar Minimap
+// Precompute Radar Highway Loop Coordinates (Zero Per-Frame Trig Overhead)
+const RADAR_HIGHWAY_POINTS = Array.from({ length: 61 }, (_, i) => {
+  const pt = getHighwayPointAtAngle((i / 60) * Math.PI * 2);
+  return { x: pt.x, z: pt.z };
+});
+
+// Highway Radar Minimap (Forza Horizon 5 Circular GPS Styling)
 function drawRadar(carX: number, carZ: number, carYaw: number) {
   radarCtx.clearRect(0, 0, 168, 168);
   radarCtx.save();
@@ -2463,19 +2692,22 @@ function drawRadar(carX: number, carZ: number, carYaw: number) {
   const lz = (OASIS_Z - carZ) * scale;
   radarCtx.fillStyle =
     currentSceneryId === 'cyber'
-      ? 'rgba(0, 240, 255, 0.38)'
+      ? 'rgba(0, 240, 255, 0.35)'
       : currentSceneryId === 'alpine'
-        ? 'rgba(125, 211, 252, 0.42)'
-        : 'rgba(14, 165, 233, 0.35)';
+        ? 'rgba(125, 211, 252, 0.38)'
+        : 'rgba(14, 165, 233, 0.32)';
   radarCtx.beginPath();
   radarCtx.arc(lx, lz, OASIS_RADIUS * scale, 0, Math.PI * 2);
   radarCtx.fill();
 
-  radarCtx.lineWidth = 4.5;
-  radarCtx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
+  // Road dark casing
+  radarCtx.lineCap = 'round';
+  radarCtx.lineJoin = 'round';
+  radarCtx.lineWidth = 8.5;
+  radarCtx.strokeStyle = 'rgba(8, 10, 16, 0.9)';
   radarCtx.beginPath();
-  for (let i = 0; i <= 60; i++) {
-    const pt = getHighwayPointAtAngle((i / 60) * Math.PI * 2);
+  for (let i = 0; i < RADAR_HIGHWAY_POINTS.length; i++) {
+    const pt = RADAR_HIGHWAY_POINTS[i];
     const rx = (pt.x - carX) * scale;
     const rz = (pt.z - carZ) * scale;
     if (i === 0) radarCtx.moveTo(rx, rz);
@@ -2483,36 +2715,56 @@ function drawRadar(carX: number, carZ: number, carYaw: number) {
   }
   radarCtx.stroke();
 
+  // Bright Horizon white asphalt loop
+  radarCtx.lineWidth = 4.2;
+  radarCtx.strokeStyle = 'rgba(255, 255, 255, 0.88)';
+  radarCtx.stroke();
+
+  // Checkpoint gates
   for (let i = 0; i < gates.length; i++) {
     const g = gates[i];
     const gx = (g.x - carX) * scale;
     const gz = (g.z - carZ) * scale;
-    radarCtx.fillStyle = g.cleared ? '#00f0ff' : '#ff2a85';
+    radarCtx.fillStyle = g.cleared ? '#00f0ff' : '#ff0055';
     radarCtx.beginPath();
-    radarCtx.arc(gx, gz, 3.5, 0, Math.PI * 2);
+    radarCtx.arc(gx, gz, 3.6, 0, Math.PI * 2);
     radarCtx.fill();
   }
 
+  // Rival Drivatars
   radarCtx.fillStyle = '#facc15';
   for (let i = 0; i < rivals.length; i++) {
     const pos = rivals[i].mesh.position;
     const rx = (pos.x - carX) * scale;
     const rz = (pos.z - carZ) * scale;
     radarCtx.beginPath();
-    radarCtx.arc(rx, rz, 2.6, 0, Math.PI * 2);
+    radarCtx.arc(rx, rz, 2.8, 0, Math.PI * 2);
     radarCtx.fill();
   }
   radarCtx.restore();
 
-  radarCtx.fillStyle = '#ff8a2b';
+  // Forza Horizon Player Chevron (White halo + Horizon Magenta core)
+  radarCtx.fillStyle = '#ffffff';
+  radarCtx.beginPath();
+  radarCtx.moveTo(84, 73);
+  radarCtx.lineTo(91, 91);
+  radarCtx.lineTo(84, 87);
+  radarCtx.lineTo(77, 91);
+  radarCtx.closePath();
+  radarCtx.fill();
+
+  radarCtx.fillStyle = '#ff0055';
   radarCtx.beginPath();
   radarCtx.moveTo(84, 76);
-  radarCtx.lineTo(89, 90);
+  radarCtx.lineTo(89, 89);
   radarCtx.lineTo(84, 86);
-  radarCtx.lineTo(79, 90);
+  radarCtx.lineTo(79, 89);
   radarCtx.closePath();
   radarCtx.fill();
 }
+
+// Render initial GPS minimap frame immediately
+drawRadar(carState.x, carState.z, carState.yaw);
 
 // Reusable Math Scratch Objects (Zero-GC Loop)
 const clock = new THREE.Clock();
@@ -2523,10 +2775,23 @@ const _fwdVec = new THREE.Vector3();
 const _upVec = new THREE.Vector3();
 const _bodyEuler = new THREE.Euler();
 const _wheelEuler = new THREE.Euler();
-const _desiredCamPos = new THREE.Vector3();
-const _dampedCamPos = new THREE.Vector3(0, 3, 8);
-const _desiredLookAt = new THREE.Vector3();
-const _dampedLookAt = new THREE.Vector3(0, 1, -5);
+let chaseCamState = createInitialChaseCameraState(0, -1);
+
+// Cached HUD strings to prevent redundant DOM layout/style thrashing
+let lastRpmScaleStr = '';
+let lastNitroScaleStr = '';
+let lastSkillTimerScaleStr = '';
+let lastSpeedStr = '';
+let lastGearStr = '';
+let lastRpmTextStr = '';
+let lastBankedXpStr = '';
+let lastGatesStr = '';
+let lastBestChainStr = '';
+
+// Adaptive frame-time monitor to prevent GPU fill-rate lag
+let smoothedFrameDt = 0.016;
+let slowFrameCounter = 0;
+let pixelRatioScaledDown = false;
 
 function syncCarAndWheelTransforms(
   pose: ReturnType<typeof getWheelGroundPose>,
@@ -2558,9 +2823,9 @@ function syncCarAndWheelTransforms(
   }
 }
 
-const initialPose = getWheelGroundPose(0, 0, 0, currentCarSpec);
-carState.y = initialPose.avgGroundY + currentCarSpec.rideHeightOffset;
-syncCarAndWheelTransforms(initialPose, 0, true);
+let lastGroundPose = getWheelGroundPose(0, 0, 0, currentCarSpec);
+carState.y = lastGroundPose.avgGroundY + currentCarSpec.rideHeightOffset;
+syncCarAndWheelTransforms(lastGroundPose, 0, true);
 
 function afterDraw(cb: () => void) {
   const gl = renderer.getContext() as WebGL2RenderingContext;
@@ -2583,9 +2848,25 @@ function afterDraw(cb: () => void) {
 }
 
 function tick() {
-  let dt = clock.getDelta();
+  const rawDt = clock.getDelta();
+  let dt = rawDt;
   if (dt > 0.05) dt = 0.05;
   const elapsed = clock.getElapsedTime();
+
+  // Adaptive resolution scaler if GPU frame rate drops below 37 FPS
+  if (!isSoftwareGl && !pixelRatioScaledDown && rawDt > 0.001 && rawDt < 0.25) {
+    smoothedFrameDt = smoothedFrameDt * 0.9 + rawDt * 0.1;
+    if (smoothedFrameDt > 0.027) {
+      slowFrameCounter++;
+      if (slowFrameCounter > 24 && renderer.getPixelRatio() > 1) {
+        pixelRatioScaledDown = true;
+        renderer.setPixelRatio(1);
+        composer.setSize(window.innerWidth, window.innerHeight);
+      }
+    } else {
+      slowFrameCounter = Math.max(0, slowFrameCounter - 1);
+    }
+  }
 
   // Animate world landmarks
   wheelRimGroup.rotation.z = elapsed * 0.22;
@@ -2604,40 +2885,139 @@ function tick() {
   bumpTex.offset.x = (elapsed * 0.015) % 1;
   bumpTex.offset.y = (elapsed * 0.01) % 1;
 
-  // Step AI Rivals along the highway loop
+  // Step AI Rivals along the highway loop with physical lateral knockback recovery
   let nearMissJustTriggered = false;
+  let tradingPaintJustTriggered = false;
+  let wreckageJustTriggered = false;
+  let landscapingJustTriggered = false;
+
   for (let i = 0; i < rivals.length; i++) {
     const r = rivals[i];
     r.theta = (r.theta + r.angularSpeed * dt) % (Math.PI * 2);
     if (r.theta < 0) r.theta += Math.PI * 2;
     if (r.nearMissCooldown > 0) r.nearMissCooldown = Math.max(0, r.nearMissCooldown - dt);
+    if (r.hitCooldown > 0) r.hitCooldown = Math.max(0, r.hitCooldown - dt);
+    if (Math.abs(r.lateralVel) > 0.01) {
+      r.laneOffset = THREE.MathUtils.clamp(r.laneOffset + r.lateralVel * dt, -11.5, 11.5);
+      r.lateralVel *= Math.exp(-4.5 * dt);
+    } else {
+      r.laneOffset = THREE.MathUtils.damp(r.laneOffset, r.baseLaneOffset, 1.8, dt);
+    }
     const pt = getHighwayPointAtAngle(r.theta);
     const rx = pt.x + pt.nx * r.laneOffset;
     const rz = pt.z + pt.nz * r.laneOffset;
-    const ry = getTerrainY(rx, rz) + 0.16;
+    const ry = getHighwayElevationAtAngle(r.theta) + 0.16;
     const dirSign = r.angularSpeed >= 0 ? 1 : -1;
-    const ryaw = Math.atan2(-pt.tx * dirSign, -pt.tz * dirSign);
+    const ryaw = Math.atan2(-pt.tx * dirSign, -pt.tz * dirSign) - r.lateralVel * 0.035;
     r.mesh.position.set(rx, ry, rz);
     r.mesh.rotation.set(0, ryaw, 0);
   }
 
+  // Step Airborne Smashed Props (Bollards, Festival Flags, Sapling Trees)
+  if (activeFlyingProps.length > 0) {
+    let bollardDirty = false;
+    let flagDirty = false;
+    let treeDirty = false;
+
+    for (let i = activeFlyingProps.length - 1; i >= 0; i--) {
+      const p = activeFlyingProps[i];
+      p.smashedAge += dt;
+
+      if (p.smashedAge < 3.6) {
+        p.vy -= 26 * dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.z += p.vz * dt;
+        p.rx += p.avx * dt;
+        p.ry += p.avy * dt;
+        p.rz += p.avz * dt;
+
+        const gY = getTerrainY(p.x, p.z) + 0.15;
+        if (p.y < gY) {
+          p.y = gY;
+          p.vy = -p.vy * 0.34;
+          p.vx *= 0.68;
+          p.vz *= 0.68;
+          p.avx *= 0.72;
+          p.avz *= 0.72;
+        }
+
+        _dummy.position.set(p.x, p.y, p.z);
+        _dummy.rotation.set(p.rx, p.ry, p.rz);
+        _dummy.scale.setScalar(p.scale);
+        _dummy.updateMatrix();
+        if (p.meshKind === 'bollard') {
+          bollardInst.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          bollardDirty = true;
+        } else if (p.meshKind === 'flag') {
+          flagInst.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          flagDirty = true;
+        } else {
+          treeTrunkInst.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          treeCone1.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          treeCone2.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          treeCone3.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          treeDirty = true;
+        }
+      } else if (
+        p.smashedAge > 22 &&
+        (carState.x - p.homeX) ** 2 + (carState.z - p.homeZ) ** 2 > 45 ** 2
+      ) {
+        // Respawn prop cleanly at its home coordinates once player drives away
+        p.smashed = false;
+        p.x = p.homeX;
+        p.y = p.homeY;
+        p.z = p.homeZ;
+        p.rx = 0;
+        p.ry = p.homeYaw;
+        p.rz = 0;
+        _dummy.position.set(p.homeX, p.homeY, p.homeZ);
+        _dummy.rotation.set(0, p.homeYaw, 0);
+        _dummy.scale.setScalar(p.scale);
+        _dummy.updateMatrix();
+        if (p.meshKind === 'bollard') {
+          bollardInst.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          bollardDirty = true;
+        } else if (p.meshKind === 'flag') {
+          flagInst.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          flagDirty = true;
+        } else {
+          treeTrunkInst.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          treeCone1.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          treeCone2.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          treeCone3.setMatrixAt(p.instanceIdx, _dummy.matrix);
+          treeDirty = true;
+        }
+        activeFlyingProps.splice(i, 1);
+      }
+    }
+
+    if (bollardDirty) bollardInst.instanceMatrix.needsUpdate = true;
+    if (flagDirty) flagInst.instanceMatrix.needsUpdate = true;
+    if (treeDirty) {
+      treeTrunkInst.instanceMatrix.needsUpdate = true;
+      treeCone1.instanceMatrix.needsUpdate = true;
+      treeCone2.instanceMatrix.needsUpdate = true;
+      treeCone3.instanceMatrix.needsUpdate = true;
+    }
+  }
+
   // Title Screen / Pause Showcase Orbit Camera (Frames Car in Right Viewport Half)
   if (gameState !== 'playing') {
-    syncCarAndWheelTransforms(getWheelGroundPose(carState.x, carState.z, carState.yaw, currentCarSpec), 0.18, true);
+    lastGroundPose = getWheelGroundPose(carState.x, carState.z, carState.yaw, currentCarSpec);
+    syncCarAndWheelTransforms(lastGroundPose, 0.18, true);
     const orbitAng = elapsed * 0.25 + 0.75;
     const radius = 7.4;
     const camX = _carPos.x + Math.sin(orbitAng) * radius;
     const camY = _carPos.y + 1.85 + Math.sin(orbitAng * 0.5) * 0.25;
     const camZ = _carPos.z + Math.cos(orbitAng) * radius;
     camera.position.set(camX, camY, camZ);
-    // Camera forward is (-sin(orbitAng), 0, -cos(orbitAng)), so camera right is (cos(orbitAng), 0, -sin(orbitAng)).
-    // Looking slightly to the camera's LEFT (-camRight * 2.15) places the car cleanly in the open RIGHT half of the screen.
     const camRightX = Math.cos(orbitAng);
     const camRightZ = -Math.sin(orbitAng);
     camera.lookAt(_carPos.x - camRightX * 2.15, _carPos.y + 0.68, _carPos.z - camRightZ * 2.15);
     sunDiscMesh.position.copy(camera.position).addScaledVector(orbDir, 1750);
     starField.position.copy(camera.position);
-    soundEngine.update(0.14, 0, false, false, 0, currentCarSpec.engineBaseHz);
+    soundEngine.update(0.14, 0, false, false, 0, currentCarSpec.engineBaseHz, dt);
     if (bloomPass.enabled) composer.render();
     else renderer.render(scene, camera);
     if (isSoftwareGl) afterDraw(tick);
@@ -2646,13 +3026,6 @@ function tick() {
   }
 
   // Active Gameplay Vehicle Physics & Controls
-  const fwdX = -Math.sin(carState.yaw);
-  const fwdZ = -Math.cos(carState.yaw);
-  const speedMs = Math.hypot(carState.vx, carState.vz);
-  const forwardVel = carState.vx * fwdX + carState.vz * fwdZ;
-  const kmh = speedMs * 3.6;
-  if (kmh > sessionTopSpeedKmh) sessionTopSpeedKmh = kmh;
-
   const driveCmd = computeEffectiveTouchDriveInput({
     keyForward: keys.forward,
     keyBackward: keys.backward,
@@ -2672,77 +3045,327 @@ function tick() {
   });
   const { throttle, steerInput, handbrake, isBoosting } = driveCmd;
 
-  const targetSteer = steerInput * THREE.MathUtils.lerp(0.46, 0.22, Math.min(1, kmh / 220));
-  currentSteerAngle = THREE.MathUtils.damp(currentSteerAngle, targetSteer, 13, dt);
+  // Sub-step vehicle kinematics at high speed or longer frame intervals for rock-solid 200-350 km/h stability
+  const subSteps = dt > 0.02 ? 2 : 1;
+  const stepDt = dt / subSteps;
 
-  const prevGroundY =
-    getWheelGroundPose(carState.x, carState.z, carState.yaw, currentCarSpec).avgGroundY +
-    currentCarSpec.rideHeightOffset;
-  const isGrounded = carState.y <= prevGroundY + 0.16 && carState.vy <= 3.5;
+  let kmh = 0;
+  let vLong = 0;
+  let isDrifting = false;
+  let newFwdX = -Math.sin(carState.yaw);
+  let newFwdZ = -Math.cos(carState.yaw);
+  let newRightX = Math.cos(carState.yaw);
+  let newRightZ = -Math.sin(carState.yaw);
+  let pose = lastGroundPose;
+  let surfaceProfile: SurfacePhysicsProfile = {
+    surface: 'asphalt',
+    gripMu: 1.08,
+    rollingResistance: 0.36,
+    waterDepth: 0,
+    waterDragCoeff: 0,
+    surfaceRoughnessAmp: 0,
+  };
 
-  if (isGrounded) {
-    if (airTime > 0.18) {
-      carState.suspensionVel = -Math.min(2.8, airTime * 3.5);
-      cameraTrauma = Math.min(0.45, cameraTrauma + airTime * 0.35);
+  for (let step = 0; step < subSteps; step++) {
+    const speedMs = Math.hypot(carState.vx, carState.vz);
+    kmh = speedMs * 3.6;
+    if (kmh > sessionTopSpeedKmh) sessionTopSpeedKmh = kmh;
+
+    const targetSteer = steerInput * THREE.MathUtils.lerp(0.46, 0.2, Math.min(1, kmh / 230));
+    currentSteerAngle = THREE.MathUtils.damp(currentSteerAngle, targetSteer, 13, stepDt);
+
+    const prevGroundY = lastGroundPose.avgGroundY + currentCarSpec.rideHeightOffset;
+    const wasGrounded = carState.isGrounded;
+
+    // 1. Evaluate Surface Friction, Rolling Resistance & Oasis Water Drag
+    const { distance: roadDist } = getRoadDistanceInfo(carState.x, carState.z);
+    const isOffroad = roadDist > ROAD_HALF_WIDTH + 3;
+    surfaceProfile = computeSurfacePhysicsProfile({
+      groundY: lastGroundPose.avgGroundY,
+      roadDistance: roadDist,
+      carId: currentCarId,
+      sceneryId: currentSceneryId,
+    });
+
+    // 2. Step Real Automotive 2D Dynamics (Slope Gravity, Weight Transfer, Pacejka Lateral Grip)
+    const hStep = stepAutomotiveHorizontalPhysics({
+      vx: carState.vx,
+      vz: carState.vz,
+      yaw: carState.yaw,
+      yawRate: carState.yawRate,
+      visualYawOffset: carState.visualYawOffset,
+      steerAngle: currentSteerAngle,
+      throttle,
+      handbrake,
+      isGrounded: wasGrounded,
+      terrainPitch: lastGroundPose.terrainPitch,
+      terrainRoll: lastGroundPose.terrainRoll,
+      carSpec: currentCarSpec,
+      surfaceProfile,
+      dt: stepDt,
+    });
+
+    carState.vx = hStep.vx;
+    carState.vz = hStep.vz;
+    carState.yaw = hStep.yaw;
+    carState.yawRate = hStep.yawRate;
+    carState.visualYawOffset = hStep.visualYawOffset;
+    vLong = hStep.vLong;
+    isDrifting = hStep.isDrifting;
+
+    newFwdX = -Math.sin(carState.yaw);
+    newFwdZ = -Math.cos(carState.yaw);
+    newRightX = Math.cos(carState.yaw);
+    newRightZ = -Math.sin(carState.yaw);
+
+    if (isBoosting) {
+      const impulse = computeSafeNitroImpulse({
+        forwardX: newFwdX,
+        forwardZ: newFwdZ,
+        kmh,
+        dt: stepDt,
+        isGrounded: wasGrounded,
+        maxNitroKmh: currentCarSpec.maxNitroKmh,
+      });
+      carState.vx += impulse.dvx;
+      carState.vz += impulse.dvz;
     }
-    airTime = 0;
-  } else {
-    airTime += dt;
-  }
 
-  const isDrifting = isGrounded && speedMs > 7.5 && (handbrake || Math.abs(carState.visualYawOffset) > 0.16);
-  if (isGrounded && speedMs > 0.4) {
-    const revSign = forwardVel < -0.5 ? -1 : 1;
-    const lowSpeedFactor = Math.min(1, speedMs / 9);
-    const turnRate = currentCarSpec.steerRate * (handbrake ? currentCarSpec.driftSteerMultiplier : 1);
-    carState.yaw += currentSteerAngle * turnRate * lowSpeedFactor * revSign * dt;
-    const slipTarget =
-      handbrake && speedMs > 7.5
-        ? currentSteerAngle * 0.68 * (currentCarId === 'kaze' ? 1.15 : 1)
-        : currentSteerAngle * Math.min(1, kmh / 180) * 0.12;
-    carState.visualYawOffset = THREE.MathUtils.damp(
-      carState.visualYawOffset,
-      slipTarget,
-      handbrake ? 7.5 : 9.5,
-      dt,
-    );
-  } else {
-    carState.visualYawOffset = THREE.MathUtils.damp(carState.visualYawOffset, 0, 6, dt);
-  }
+    carState.x += carState.vx * stepDt;
+    carState.z += carState.vz * stepDt;
+    const bound = WORLD_SIZE * 0.46;
+    carState.x = THREE.MathUtils.clamp(carState.x, -1380, bound);
+    carState.z = THREE.MathUtils.clamp(carState.z, -1380, bound);
 
-  const newFwdX = -Math.sin(carState.yaw);
-  const newFwdZ = -Math.cos(carState.yaw);
-  const newRightX = Math.cos(carState.yaw);
-  const newRightZ = -Math.sin(carState.yaw);
-  let vLong = carState.vx * newFwdX + carState.vz * newFwdZ;
-  let vLat = carState.vx * newRightX + carState.vz * newRightZ;
+    // 3. Resolve Map Obstacle Physics via Spatial Hash Grid (3x3 Neighbor Cells)
+    const carRadius = currentCarId === 'titan' ? 1.52 : 1.36;
+    const baseCellX = Math.floor(carState.x / COLLIDER_CELL_SIZE) + 500;
+    const baseCellZ = Math.floor(carState.z / COLLIDER_CELL_SIZE) + 500;
 
-  taillightMat.emissiveIntensity = (throttle < 0 && vLong > 1.5) || handbrake ? 5.2 : 2.4;
+    for (let ox = -1; ox <= 1; ox++) {
+      for (let oz = -1; oz <= 1; oz++) {
+        const cellKey = ((baseCellX + ox) << 12) | ((baseCellZ + oz) & 0xfff);
 
-  // Off-road surface drag (Titan 4x4 ignores off-road penalty!)
-  const { distance: roadDist } = getRoadDistanceInfo(carState.x, carState.z);
-  const isOffroad = roadDist > ROAD_HALF_WIDTH + 3;
-  const offroadDragFactor = isOffroad && currentCarId !== 'titan' ? 0.88 : 1.0;
+        // 3a. Destructible Smashable Props (Bollards, Festival Flags, Sapling Trees)
+        const smashBucket = smashableGrid.get(cellKey);
+        if (smashBucket) {
+          for (let j = 0; j < smashBucket.length; j++) {
+            const prop = smashBucket[j];
+            if (prop.smashed) continue;
+            const res = resolveMapColliderImpact({
+              carX: carState.x,
+              carZ: carState.z,
+              carVx: carState.vx,
+              carVz: carState.vz,
+              carYaw: carState.yaw,
+              carRadius,
+              colX: prop.homeX,
+              colZ: prop.homeZ,
+              colRadius: prop.radius,
+              kind: 'smashable',
+            });
+            if (res.collided) {
+              prop.smashed = true;
+              prop.smashedAge = 0;
+              prop.x = prop.homeX;
+              prop.y = prop.homeY + 0.25;
+              prop.z = prop.homeZ;
+              prop.vx = res.propLaunchVx + (Math.random() - 0.5) * 4;
+              prop.vy = res.propLaunchVy + Math.random() * 2.5;
+              prop.vz = res.propLaunchVz + (Math.random() - 0.5) * 4;
+              prop.avx = (Math.random() - 0.5) * 14;
+              prop.avy = (Math.random() - 0.5) * 10;
+              prop.avz = (Math.random() - 0.5) * 14;
+              activeFlyingProps.push(prop);
 
-  if (isGrounded) {
-    const maxCarMs = (currentCarSpec.maxSpeedKmh * offroadDragFactor) / 3.6;
-    if (throttle > 0) {
-      const headroom = Math.max(0, 1 - Math.max(0, vLong) / maxCarMs);
-      const accel = vLong < 0 ? 34 : currentCarSpec.accelRate * Math.pow(headroom, 0.7);
-      vLong += accel * dt;
-    } else if (throttle < 0) {
-      if (vLong > 1.2) vLong = Math.max(0, vLong - 38 * dt);
-      else if (vLong > -68 / 3.6) vLong -= 16.5 * dt;
+              carState.vx = res.carVx;
+              carState.vz = res.carVz;
+              cameraTrauma = Math.min(0.28, cameraTrauma + 0.08);
+              soundEngine.playChime(prop.meshKind === 'sapling' ? 520 : 640, 0.09);
+
+              if (prop.meshKind === 'sapling') {
+                landscapingJustTriggered = true;
+              } else {
+                wreckageJustTriggered = true;
+              }
+
+              for (let sp = 0; sp < 5; sp++) {
+                spawnParticle(
+                  prop.homeX,
+                  prop.homeY + 1.1,
+                  prop.homeZ,
+                  res.propLaunchVx * 0.4 + (Math.random() - 0.5) * 8,
+                  2.5 + Math.random() * 5,
+                  res.propLaunchVz * 0.4 + (Math.random() - 0.5) * 8,
+                  0.26,
+                  0.6,
+                  0.48,
+                  prop.debrisColorHex,
+                );
+              }
+            }
+          }
+        }
+
+        // 3b. Rigid Map Colliders (Rocks, Boulders, Thick Trees, Bridge Pylons, Gate Pillars)
+        const rigidBucket = rigidGrid.get(cellKey);
+        if (rigidBucket) {
+          for (let j = 0; j < rigidBucket.length; j++) {
+            const col = rigidBucket[j];
+            const res = resolveMapColliderImpact({
+              carX: carState.x,
+              carZ: carState.z,
+              carVx: carState.vx,
+              carVz: carState.vz,
+              carYaw: carState.yaw,
+              carRadius,
+              colX: col.x,
+              colZ: col.z,
+              colRadius: col.radius,
+              kind: 'rigid',
+            });
+            if (res.collided) {
+              carState.x = res.carX;
+              carState.z = res.carZ;
+              carState.vx = res.carVx;
+              carState.vz = res.carVz;
+              carState.yaw += res.carYawDelta;
+              carState.yawRate += res.carYawDelta * 8;
+              if (res.impactSpeedKmh > 18) {
+                const traumaAdd = Math.min(0.45, (res.impactSpeedKmh / 180) * 0.38);
+                cameraTrauma = Math.min(0.5, cameraTrauma + traumaAdd);
+                soundEngine.playChime(320, 0.14);
+                const sparkCount = Math.min(8, 2 + Math.floor(res.impactSpeedKmh / 35));
+                for (let sp = 0; sp < sparkCount; sp++) {
+                  spawnParticle(
+                    carState.x - res.normalX * carRadius,
+                    carState.y + 0.35,
+                    carState.z - res.normalZ * carRadius,
+                    res.normalX * (4 + Math.random() * 8) + (Math.random() - 0.5) * 7,
+                    2 + Math.random() * 5,
+                    res.normalZ * (4 + Math.random() * 8) + (Math.random() - 0.5) * 7,
+                    0.22,
+                    0.4,
+                    0.35,
+                    col.sparkColorHex,
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 4. AI Rival Collisions (2-Body Momentum Exchange) & Near-Misses
+    for (let i = 0; i < rivals.length; i++) {
+      const r = rivals[i];
+      const rPos = r.mesh.position;
+      const dist = Math.hypot(carState.x - rPos.x, carState.z - rPos.z);
+      if (dist < 3.6 && dist > 0.01) {
+        const res = resolveMapColliderImpact({
+          carX: carState.x,
+          carZ: carState.z,
+          carVx: carState.vx,
+          carVz: carState.vz,
+          carYaw: carState.yaw,
+          carRadius: 1.45,
+          colX: rPos.x,
+          colZ: rPos.z,
+          colRadius: 2.15,
+          kind: 'rival',
+        });
+        carState.x = res.carX;
+        carState.z = res.carZ;
+        carState.vx = res.carVx;
+        carState.vz = res.carVz;
+        carState.yaw += res.carYawDelta * 0.6;
+        // Transfer lateral momentum to the rival car so it gets shoved across the lane
+        const pt = getHighwayPointAtAngle(r.theta);
+        const rivalPushLat = res.propLaunchVx * pt.nx + res.propLaunchVz * pt.nz;
+        r.lateralVel = THREE.MathUtils.clamp(r.lateralVel + rivalPushLat * 0.55, -14, 14);
+        cameraTrauma = Math.min(0.38, cameraTrauma + 0.18);
+        if (r.hitCooldown === 0 && kmh > 45) {
+          r.hitCooldown = 3.0;
+          tradingPaintJustTriggered = true;
+          soundEngine.playChime(440, 0.14);
+          for (let sp = 0; sp < 6; sp++) {
+            spawnParticle(
+              (carState.x + rPos.x) * 0.5,
+              carState.y + 0.45,
+              (carState.z + rPos.z) * 0.5,
+              (Math.random() - 0.5) * 10,
+              2.5 + Math.random() * 5,
+              (Math.random() - 0.5) * 10,
+              0.2,
+              0.4,
+              0.32,
+              0xffaa3b,
+            );
+          }
+        }
+      } else if (dist < 7.8 && kmh > 95 && r.nearMissCooldown === 0) {
+        r.nearMissCooldown = 4.5;
+        nearMissJustTriggered = true;
+        soundEngine.playChime(920, 0.15);
+      }
+    }
+
+    // 5. 4-Wheel Ground Pose & Vertical Ballistic / Downforce Physics
+    pose = getWheelGroundPose(carState.x, carState.z, carState.yaw, currentCarSpec);
+    lastGroundPose = pose;
+    const targetY = pose.avgGroundY + currentCarSpec.rideHeightOffset;
+
+    const vStep = stepVerticalGroundPhysics({
+      wasGrounded,
+      currentY: carState.y,
+      currentVy: carState.vy,
+      prevGroundY,
+      targetGroundY: targetY,
+      prevSlopeRate: carState.slopeRate,
+      kmh,
+      isOffroad,
+      dt: stepDt,
+    });
+
+    carState.isGrounded = vStep.isGrounded;
+    carState.y = vStep.y;
+    carState.vy = vStep.vy;
+    carState.slopeRate = vStep.slopeRate;
+
+    if (vStep.isGrounded) {
+      if (vStep.justLanded && airTime > 0.22) {
+        carState.suspensionVel = -Math.min(2.4, airTime * 3.0);
+        cameraTrauma = Math.min(0.38, cameraTrauma + airTime * 0.28);
+      }
+      // Off-road surface micro-bumps excite the suspension spring-damper
+      if (surfaceProfile.surfaceRoughnessAmp > 0 && kmh > 25) {
+        const bumpWave =
+          Math.sin(carState.x * 0.85 + carState.z * 0.65) *
+          surfaceProfile.surfaceRoughnessAmp *
+          Math.min(1, kmh / 140);
+        carState.suspensionVel += bumpWave * 18 * stepDt;
+      }
+      airTime = 0;
     } else {
-      vLong *= Math.exp(-0.55 * dt);
-      if (Math.abs(vLong) < 0.15) vLong = 0;
+      airTime += stepDt;
     }
-    if (handbrake) vLong *= Math.exp(-0.65 * dt);
-    vLat *= Math.exp(-(handbrake ? currentCarSpec.driftLateralDamping : 11.5) * dt);
+
+    carState.suspensionVel +=
+      (-140 * carState.suspensionBounce - 18 * carState.suspensionVel) * stepDt;
+    carState.suspensionBounce += carState.suspensionVel * stepDt;
+
+    // 6. Dynamic Longitudinal Squat/Dive & Centripetal Body Roll
+    const squat =
+      THREE.MathUtils.clamp(hStep.accelLong * 0.0012, -0.032, 0.028) + (isBoosting ? 0.015 : 0);
+    const bodyRoll = THREE.MathUtils.clamp(-hStep.accelLat * 0.0018, -0.095, 0.095);
+    carState.pitch = THREE.MathUtils.damp(carState.pitch, pose.terrainPitch + squat, 14, stepDt);
+    carState.roll = THREE.MathUtils.damp(carState.roll, pose.terrainRoll + bodyRoll, 14, stepDt);
+    carState.wheelSpin += (vLong / currentCarSpec.wheelRadius) * stepDt;
   }
 
-  carState.vx = newFwdX * vLong + newRightX * vLat;
-  carState.vz = newFwdZ * vLong + newRightZ * vLat;
+  const isGrounded = carState.isGrounded;
+  taillightMat.emissiveIntensity = (throttle < 0 && vLong > 1.5) || handbrake ? 5.2 : 2.4;
 
   nitroFlameL.visible = isBoosting;
   nitroFlameR.visible = isBoosting;
@@ -2751,18 +3374,6 @@ function tick() {
     const flicker = 0.85 + Math.sin(elapsed * 45) * 0.25;
     nitroFlameL.scale.set(1, 1, flicker);
     nitroFlameR.scale.set(1, 1, flicker);
-
-    const impulse = computeSafeNitroImpulse({
-      forwardX: newFwdX,
-      forwardZ: newFwdZ,
-      kmh,
-      dt,
-      isGrounded,
-      maxNitroKmh: currentCarSpec.maxNitroKmh,
-    });
-    carState.vx += impulse.dvx;
-    carState.vz += impulse.dvz;
-    cameraTrauma = Math.min(0.55, cameraTrauma + dt * 1.2);
 
     const exX = carState.x - newFwdX * 2.4;
     const exY = carState.y + 0.05;
@@ -2795,98 +3406,59 @@ function tick() {
     nitroCharge = Math.min(1, nitroCharge + dt * 0.15);
   }
 
-  carState.x += carState.vx * dt;
-  carState.z += carState.vz * dt;
-  const bound = WORLD_SIZE * 0.46;
-  carState.x = THREE.MathUtils.clamp(carState.x, -1380, bound);
-  carState.z = THREE.MathUtils.clamp(carState.z, -1380, bound);
-
-  const pose = getWheelGroundPose(carState.x, carState.z, carState.yaw, currentCarSpec);
-  const targetY = pose.avgGroundY + currentCarSpec.rideHeightOffset;
-  const slopeRate = (targetY - prevGroundY) / Math.max(dt, 0.001);
-
-  if (isGrounded) {
-    if (slopeRate < -6.5 && kmh > 135 && carState.vy > 1.5) {
-      carState.y += carState.vy * dt;
-    } else {
-      carState.y = targetY;
-      carState.vy = THREE.MathUtils.clamp(slopeRate, -12, 9);
-    }
-  } else {
-    carState.vy -= 22 * dt;
-    carState.y += carState.vy * dt;
-    if (carState.y <= targetY) {
-      carState.y = targetY;
-      carState.vy = 0;
-    }
-  }
-
-  carState.suspensionVel += (-140 * carState.suspensionBounce - 16 * carState.suspensionVel) * dt;
-  carState.suspensionBounce += carState.suspensionVel * dt;
-
-  const squat = (throttle > 0 ? 0.018 : throttle < 0 ? -0.024 : 0) + (isBoosting ? 0.018 : 0);
-  const bodyRoll = -currentSteerAngle * Math.min(1, kmh / 110) * (isDrifting ? 0.085 : 0.048);
-  carState.pitch = THREE.MathUtils.damp(carState.pitch, pose.terrainPitch + squat, 14, dt);
-  carState.roll = THREE.MathUtils.damp(carState.roll, pose.terrainRoll + bodyRoll, 14, dt);
-  carState.wheelSpin += (vLong / currentCarSpec.wheelRadius) * dt;
-
   chassisBody.position.set(carState.x, carState.y, carState.z);
   chassisBody.velocity.set(carState.vx, carState.vy, carState.vz);
   syncCarAndWheelTransforms(pose, currentSteerAngle, isGrounded);
 
-  // Rival Collisions & Near-Misses
-  for (let i = 0; i < rivals.length; i++) {
-    const r = rivals[i];
-    const rPos = r.mesh.position;
-    const dx = carState.x - rPos.x;
-    const dz = carState.z - rPos.z;
-    const dist = Math.hypot(dx, dz);
-    if (dist < 3.6 && dist > 0.01) {
-      const push = (3.6 - dist) * 0.8;
-      carState.x += (dx / dist) * push;
-      carState.z += (dz / dist) * push;
-      cameraTrauma = Math.min(0.4, cameraTrauma + 0.2);
-    } else if (dist < 7.8 && kmh > 95 && r.nearMissCooldown === 0) {
-      r.nearMissCooldown = 4.5;
-      nearMissJustTriggered = true;
-      soundEngine.playChime(920, 0.15);
-    }
-  }
-
-  // Drift Smoke & Tire Skidmarks
-  if (isDrifting && isGrounded) {
+  // Surface-Specific Tire Plumes (Asphalt Drift Smoke, Oasis Water Spray, Canyon Dirt, Alpine Snow)
+  if (isGrounded && (isDrifting || (surfaceProfile.surface !== 'asphalt' && kmh > 38))) {
     const rearWheels = [
       { x: pose.rlX, y: pose.hRL + 0.18, z: pose.rlZ },
       { x: pose.rrX, y: pose.hRR + 0.18, z: pose.rrZ },
     ];
+    const plumeColor =
+      surfaceProfile.surface === 'water'
+        ? 0x7dd3fc
+        : surfaceProfile.surface === 'dirt'
+          ? currentSceneryId === 'cyber'
+            ? 0xa855f7
+            : 0xd97736
+          : surfaceProfile.surface === 'snow'
+            ? 0xf1f5f9
+            : 0xe2e8f0;
+    const upKick = surfaceProfile.surface === 'water' ? 2.4 : 0.9;
     for (let i = 0; i < 2; i++) {
       const rw = rearWheels[i];
       spawnParticle(
         rw.x + (Math.random() - 0.5) * 0.25,
         rw.y,
         rw.z + (Math.random() - 0.5) * 0.25,
-        (Math.random() - 0.5) * 2.2,
-        0.7 + Math.random() * 0.9,
-        (Math.random() - 0.5) * 2.2,
+        (Math.random() - 0.5) * 2.4,
+        upKick + Math.random() * 1.2,
+        (Math.random() - 0.5) * 2.4,
         0.28,
         1.65,
-        0.55,
-        0xe2e8f0,
+        0.52,
+        plumeColor,
       );
     }
-    skidTimer += dt;
-    if (skidTimer >= 0.045) {
-      skidTimer = 0;
-      const vYaw = carState.yaw + carState.visualYawOffset;
-      spawnSkid(pose.rlX, pose.hRL, pose.rlZ, vYaw);
-      spawnSkid(pose.rrX, pose.hRR, pose.rrZ, vYaw);
+    if (isDrifting) {
+      skidTimer += dt;
+      if (skidTimer >= 0.045) {
+        skidTimer = 0;
+        const vYaw = carState.yaw + carState.visualYawOffset;
+        spawnSkid(pose.rlX, pose.hRL, pose.rlZ, vYaw);
+        spawnSkid(pose.rrX, pose.hRR, pose.rrZ, vYaw);
+      }
     }
   }
 
-  // Update Particle & Skid Buffers
+  // Update Particle & Skid Buffers (only upload GPU buffers when dirty)
+  let anyParticleUpdated = false;
   for (let i = 0; i < MAX_PARTICLES; i++) {
     const p = particles[i];
     if (!p.active) continue;
+    anyParticleUpdated = true;
     p.age += dt;
     if (p.age >= p.maxAge) {
       p.active = false;
@@ -2905,15 +3477,20 @@ function tick() {
     _dummy.scale.setScalar(s);
     _dummy.updateMatrix();
     particleInst.setMatrixAt(i, _dummy.matrix);
-    _instColor.setHex(p.colorHex);
-    particleInst.setColorAt(i, _instColor);
   }
-  particleInst.instanceMatrix.needsUpdate = true;
-  if (particleInst.instanceColor) particleInst.instanceColor.needsUpdate = true;
+  if (anyParticleUpdated) {
+    particleInst.instanceMatrix.needsUpdate = true;
+  }
+  if (particleColorsDirty && particleInst.instanceColor) {
+    particleInst.instanceColor.needsUpdate = true;
+    particleColorsDirty = false;
+  }
 
+  let anySkidUpdated = false;
   for (let i = 0; i < MAX_SKIDS; i++) {
     const s = skids[i];
     if (!s.active) continue;
+    anySkidUpdated = true;
     s.age += dt;
     if (s.age >= s.maxAge) {
       s.active = false;
@@ -2930,7 +3507,9 @@ function tick() {
     _dummy.updateMatrix();
     skidInst.setMatrixAt(i, _dummy.matrix);
   }
-  skidInst.instanceMatrix.needsUpdate = true;
+  if (anySkidUpdated) {
+    skidInst.instanceMatrix.needsUpdate = true;
+  }
 
   // Checkpoint Gates & Horizon Skill Chain
   let gateJustCleared = false;
@@ -2957,6 +3536,24 @@ function tick() {
     addMult += 0.5;
     skillHit = true;
     skillState.lastSkillLabel = 'HORIZON CHECKPOINT +500';
+  }
+  if (wreckageJustTriggered) {
+    addPts += 250;
+    addMult += 0.25;
+    skillHit = true;
+    skillState.lastSkillLabel = 'WRECKAGE +250';
+  }
+  if (landscapingJustTriggered) {
+    addPts += 300;
+    addMult += 0.3;
+    skillHit = true;
+    skillState.lastSkillLabel = 'LANDSCAPING +300';
+  }
+  if (tradingPaintJustTriggered) {
+    addPts += 350;
+    addMult += 0.35;
+    skillHit = true;
+    skillState.lastSkillLabel = 'TRADING PAINT +350';
   }
   if (nearMissJustTriggered) {
     addPts += 400;
@@ -3002,37 +3599,37 @@ function tick() {
   }
   if (bankedFlashTimer > 0) bankedFlashTimer = Math.max(0, bankedFlashTimer - dt);
 
-  // Camera Follow & FOV
+  // Camera Follow & FOV (Car-Anchored Relative Damping — Zero 200+ km/h Rubber-Banding)
   const speedRatio = Math.min(1, kmh / 245);
   const targetFov = 60 + speedRatio * 20 + (isBoosting ? 4 : 0);
-  camera.fov = THREE.MathUtils.damp(camera.fov, targetFov, 7, dt);
-  camera.updateProjectionMatrix();
+  const nextFov = THREE.MathUtils.damp(camera.fov, targetFov, 7, dt);
+  if (Math.abs(nextFov - camera.fov) > 0.02) {
+    camera.fov = nextFov;
+    camera.updateProjectionMatrix();
+  }
 
-  cameraTrauma = Math.max(0, cameraTrauma - dt * 2.4);
-  const shakeOffset = cameraTrauma * cameraTrauma * (Math.random() - 0.5) * 0.22;
+  cameraTrauma = Math.max(0, cameraTrauma - dt * 2.8);
+  const shakeOffset = cameraTrauma * cameraTrauma * Math.sin(elapsed * 42) * 0.14;
 
   if (cameraMode === 'chase') {
-    const camDist = 6.4 + (throttle > 0 ? 0.5 : 0) + (isBoosting ? 0.65 : 0) + (currentCarId === 'titan' ? 0.6 : 0);
-    const camHeight = 2.2 + speedRatio * 0.35 + (currentCarId === 'titan' ? 0.45 : 0);
-    const driftSwing = carState.visualYawOffset * 1.45;
-    _desiredCamPos.set(
-      _carPos.x - newFwdX * camDist + newRightX * driftSwing,
-      _carPos.y + camHeight,
-      _carPos.z - newFwdZ * camDist + newRightZ * driftSwing,
-    );
-    const groundUnderCam = getTerrainY(_desiredCamPos.x, _desiredCamPos.z);
-    if (_desiredCamPos.y < groundUnderCam + 1.45) {
-      _desiredCamPos.y = groundUnderCam + 1.45;
-    }
-    _dampedCamPos.x = THREE.MathUtils.damp(_dampedCamPos.x, _desiredCamPos.x, 13, dt);
-    _dampedCamPos.y = THREE.MathUtils.damp(_dampedCamPos.y, _desiredCamPos.y, 11, dt);
-    _dampedCamPos.z = THREE.MathUtils.damp(_dampedCamPos.z, _desiredCamPos.z, 13, dt);
-
-    _desiredLookAt.set(_carPos.x + newFwdX * 8.5, _carPos.y + 0.82 + shakeOffset, _carPos.z + newFwdZ * 8.5);
-    _dampedLookAt.lerp(_desiredLookAt, 1 - Math.exp(-18 * dt));
-    camera.position.copy(_dampedCamPos);
-    camera.lookAt(_dampedLookAt);
-    const targetRoll = -currentSteerAngle * Math.min(1, kmh / 95) * 0.09;
+    const camOut = stepChaseCameraRelative(chaseCamState, {
+      carX: _carPos.x,
+      carY: _carPos.y,
+      carZ: _carPos.z,
+      carFwdX: newFwdX,
+      carFwdZ: newFwdZ,
+      visualYawOffset: carState.visualYawOffset,
+      kmh,
+      throttle,
+      isBoosting,
+      isTitan: currentCarId === 'titan',
+      dt,
+      getGroundHeight: getTerrainY,
+    });
+    chaseCamState = camOut.state;
+    camera.position.set(camOut.camX, camOut.camY, camOut.camZ);
+    camera.lookAt(camOut.lookAtX, camOut.lookAtY + shakeOffset, camOut.lookAtZ);
+    const targetRoll = -currentSteerAngle * Math.min(1, kmh / 95) * 0.08;
     cameraRoll = THREE.MathUtils.damp(cameraRoll, targetRoll, 8, dt);
     camera.rotation.z += cameraRoll;
   } else {
@@ -3041,15 +3638,20 @@ function tick() {
     const hoodY = currentCarId === 'titan' ? 1.18 : 0.84;
     camera.position.set(
       _carPos.x + _fwdVec.x * 0.45 + _upVec.x * hoodY,
-      _carPos.y + _fwdVec.y * 0.45 + _upVec.y * hoodY + shakeOffset * 0.4,
+      _carPos.y + _fwdVec.y * 0.45 + _upVec.y * hoodY + shakeOffset * 0.35,
       _carPos.z + _fwdVec.z * 0.45 + _upVec.z * hoodY,
     );
     camera.lookAt(_carPos.x + _fwdVec.x * 24, _carPos.y + _fwdVec.y * 24 + 0.4, _carPos.z + _fwdVec.z * 24);
   }
 
   if (!isSoftwareGl) {
-    dirLight.target.position.copy(_carPos);
-    dirLight.position.copy(_carPos).addScaledVector(sunDir, 160);
+    // Snap shadow target to 0.5m grid increments and update world matrix to eliminate high-speed shadow shimmer
+    const snapX = Math.round(_carPos.x * 2) * 0.5;
+    const snapY = Math.round(_carPos.y * 2) * 0.5;
+    const snapZ = Math.round(_carPos.z * 2) * 0.5;
+    dirLight.target.position.set(snapX, snapY, snapZ);
+    dirLight.target.updateMatrixWorld();
+    dirLight.position.set(snapX, snapY, snapZ).addScaledVector(sunDir, 160);
   }
 
   // Digital Telemetry & HUD Update
@@ -3071,22 +3673,55 @@ function tick() {
   const gearProg = Math.max(0, Math.min(1, (kmh - lowKmh) / Math.max(1, highKmh - lowKmh)));
   const rpmNorm = Math.min(0.98, Math.max(0.14, 0.22 + gearProg * 0.68 + (throttle > 0 ? 0.08 : 0)));
 
-  hudRpmBarEl.style.transform = `scaleX(${rpmNorm.toFixed(3)})`;
-  hudNitroBarEl.style.transform = `scaleX(${nitroCharge.toFixed(3)})`;
-  if (touchNitroFillEl) {
-    touchNitroFillEl.style.transform = `scaleX(${nitroCharge.toFixed(3)})`;
+  const rpmScaleStr = `scaleX(${rpmNorm.toFixed(3)})`;
+  if (rpmScaleStr !== lastRpmScaleStr) {
+    lastRpmScaleStr = rpmScaleStr;
+    hudRpmBarEl.style.transform = rpmScaleStr;
+    if (hudRpmArcEl) {
+      // 240° sweep length of r=82 circle is 343.48px
+      hudRpmArcEl.style.strokeDashoffset = (343.48 * (1 - rpmNorm)).toFixed(1);
+    }
   }
-  hudSkillTimerEl.style.transform = `scaleX(${(skillState.cleanTimer / 3).toFixed(3)})`;
-  soundEngine.update(rpmNorm, throttle, isDrifting, true, kmh, currentCarSpec.engineBaseHz);
+
+  const nitroScaleStr = `scaleX(${nitroCharge.toFixed(3)})`;
+  if (nitroScaleStr !== lastNitroScaleStr) {
+    lastNitroScaleStr = nitroScaleStr;
+    hudNitroBarEl.style.transform = nitroScaleStr;
+    if (hudNitroArcEl) {
+      // 95° sweep length of r=93 circle is 154.2px
+      hudNitroArcEl.style.strokeDashoffset = (154.2 * (1 - nitroCharge)).toFixed(1);
+    }
+    if (touchNitroFillEl) {
+      touchNitroFillEl.style.transform = nitroScaleStr;
+    }
+  }
+
+  const skillTimerScaleStr = `scaleX(${(skillState.cleanTimer / 3).toFixed(3)})`;
+  if (skillTimerScaleStr !== lastSkillTimerScaleStr) {
+    lastSkillTimerScaleStr = skillTimerScaleStr;
+    hudSkillTimerEl.style.transform = skillTimerScaleStr;
+  }
+
+  soundEngine.update(rpmNorm, throttle, isDrifting, true, kmh, currentCarSpec.engineBaseHz, dt);
 
   hudUpdateAccumulator += dt;
   if (hudUpdateAccumulator >= 0.065) {
     hudUpdateAccumulator = 0;
-    const dispSpeed = Math.round(speedUnit === 'KMH' ? kmh : kmh * 0.621371);
-    hudSpeedEl.textContent = String(dispSpeed);
-    hudGearEl.textContent = gear;
+    const dispSpeedStr = String(Math.round(speedUnit === 'KMH' ? kmh : kmh * 0.621371));
+    if (dispSpeedStr !== lastSpeedStr) {
+      lastSpeedStr = dispSpeedStr;
+      hudSpeedEl.textContent = dispSpeedStr;
+    }
+    if (gear !== lastGearStr) {
+      lastGearStr = gear;
+      hudGearEl.textContent = gear;
+    }
     hudGearBoxEl.classList.toggle('redline', rpmNorm > 0.86);
-    hudRpmTextEl.textContent = `${Math.round(1100 + rpmNorm * 7900).toLocaleString()} RPM`;
+    const rpmTextStr = `${Math.round(1100 + rpmNorm * 7900).toLocaleString()} RPM`;
+    if (rpmTextStr !== lastRpmTextStr) {
+      lastRpmTextStr = rpmTextStr;
+      hudRpmTextEl.textContent = rpmTextStr;
+    }
 
     if (skillState.activeScore > 0) {
       skillChainCardEl.classList.add('active');
@@ -3104,9 +3739,21 @@ function tick() {
       skillChainCardEl.classList.remove('active', 'banked-flash');
     }
 
-    hudBankedXpEl.textContent = skillState.bankedScore.toLocaleString();
-    hudGatesCountEl.textContent = `${gatesClearedCount} / ${GATE_COUNT}`;
-    hudBestChainEl.textContent = skillState.bestChainScore.toLocaleString();
+    const bankedStr = skillState.bankedScore.toLocaleString();
+    if (bankedStr !== lastBankedXpStr) {
+      lastBankedXpStr = bankedStr;
+      hudBankedXpEl.textContent = bankedStr;
+    }
+    const gatesStr = `${gatesClearedCount} / ${GATE_COUNT}`;
+    if (gatesStr !== lastGatesStr) {
+      lastGatesStr = gatesStr;
+      hudGatesCountEl.textContent = gatesStr;
+    }
+    const bestChainStr = skillState.bestChainScore.toLocaleString();
+    if (bestChainStr !== lastBestChainStr) {
+      lastBestChainStr = bestChainStr;
+      hudBestChainEl.textContent = bestChainStr;
+    }
     drawRadar(carState.x, carState.z, carState.yaw);
   }
 
@@ -3127,5 +3774,5 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(w, h);
   composer.setSize(w, h);
-  bloomPass.resolution.set(w, h);
+  bloomPass.resolution.set(Math.max(1, Math.floor(w * 0.5)), Math.max(1, Math.floor(h * 0.5)));
 });

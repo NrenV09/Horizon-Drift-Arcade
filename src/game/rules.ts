@@ -75,6 +75,14 @@ export function getHighwayPointAtAngle(theta: number): {
   return { x, z, tx, tz, nx, nz };
 }
 
+export function getHighwayElevationAtAngle(theta: number): number {
+  return (
+    8.5 * (1 - Math.cos(theta)) +
+    4.2 * Math.sin(2 * theta) -
+    2.1 * Math.sin(4 * theta)
+  );
+}
+
 /**
  * Returns perpendicular distance from world (x, z) to the asphalt highway loop centerline,
  * plus the polar angle theta on the loop.
@@ -123,10 +131,7 @@ export function getRoadDistanceInfo(x: number, z: number): {
   const distance = Math.hypot(ex, ez);
 
   // Smooth rolling elevation along the highway loop (0 at theta=0 so origin sits at y=0)
-  const roadElevation =
-    8.5 * (1 - Math.cos(theta)) +
-    4.2 * Math.sin(2 * theta) -
-    2.1 * Math.sin(4 * theta);
+  const roadElevation = getHighwayElevationAtAngle(theta);
 
   return { distance, signedOffset, theta, roadElevation };
 }
@@ -143,7 +148,11 @@ export function computeTerrainHeight(
   const { distance, roadElevation } = getRoadDistanceInfo(x, z);
 
   // Wide flat roadbed margin guarantees zero diagonal triangle poke-through on curves
+  // and fast-paths height queries on the highway without evaluating 3 octaves of simplex noise.
   const flatMargin = ROAD_HALF_WIDTH + ROAD_FLAT_SHOULDER;
+  if (distance <= flatMargin) {
+    return roadElevation;
+  }
   const roadBlend = smoothstep(flatMargin, flatMargin + ROAD_SHOULDER_WIDTH, distance);
 
   const sample = noise2D
@@ -892,4 +901,627 @@ export function getScenerySpec(id?: string | null): ScenerySpec {
   }
   return SCENERY_CATALOG.canyon;
 }
+
+export interface VerticalPhysicsStepInput {
+  wasGrounded: boolean;
+  currentY: number;
+  currentVy: number;
+  prevGroundY: number;
+  targetGroundY: number;
+  prevSlopeRate: number;
+  kmh: number;
+  isOffroad: boolean;
+  dt: number;
+}
+
+export interface VerticalPhysicsStepOutput {
+  isGrounded: boolean;
+  justLanded: boolean;
+  y: number;
+  vy: number;
+  slopeRate: number;
+}
+
+/**
+ * Steps vertical ride height and grounded/airborne transitions without false uphill
+ * detachment at >= 200 km/h. On the asphalt highway corridor, aerodynamic downforce keeps
+ * the car planted across rolling uphill/downhill grades. Off-road, cresting a sharp dune
+ * at high speed cleanly launches the car into a ballistic jump.
+ */
+export function stepVerticalGroundPhysics(input: VerticalPhysicsStepInput): VerticalPhysicsStepOutput {
+  const safeDt = Math.max(input.dt, 0.0005);
+  const rawSlopeRate = (input.targetGroundY - input.prevGroundY) / safeDt;
+  const slopeRate = Math.max(-24, Math.min(24, rawSlopeRate));
+
+  if (input.wasGrounded) {
+    // Only launch off sharp off-road hill crests when ground drops away beneath a rising car
+    const crestDrop = slopeRate - input.prevSlopeRate;
+    if (
+      input.isOffroad &&
+      input.kmh > 115 &&
+      input.prevSlopeRate > 2.2 &&
+      crestDrop < -13.5
+    ) {
+      const launchVy = Math.min(11, Math.max(2.0, input.prevSlopeRate));
+      const nextVy = launchVy - 22 * safeDt;
+      const nextY = input.currentY + nextVy * safeDt;
+      if (nextY > input.targetGroundY + 0.04) {
+        return {
+          isGrounded: false,
+          justLanded: false,
+          y: nextY,
+          vy: nextVy,
+          slopeRate,
+        };
+      }
+    }
+
+    return {
+      isGrounded: true,
+      justLanded: false,
+      y: input.targetGroundY,
+      vy: Math.max(-14, Math.min(12, slopeRate)),
+      slopeRate,
+    };
+  }
+
+  // Airborne ballistic trajectory with gravity + high-speed downforce
+  const nextVy = input.currentVy - 22 * safeDt;
+  const nextY = input.currentY + nextVy * safeDt;
+  if (nextY <= input.targetGroundY + 0.02) {
+    return {
+      isGrounded: true,
+      justLanded: true,
+      y: input.targetGroundY,
+      vy: Math.max(-12, Math.min(9, slopeRate)),
+      slopeRate,
+    };
+  }
+
+  return {
+    isGrounded: false,
+    justLanded: false,
+    y: nextY,
+    vy: nextVy,
+    slopeRate,
+  };
+}
+
+export interface ChaseCameraState {
+  fwdX: number;
+  fwdZ: number;
+  dist: number;
+  height: number;
+  verticalOffset: number;
+  driftSwing: number;
+}
+
+export function createInitialChaseCameraState(carFwdX = 0, carFwdZ = -1): ChaseCameraState {
+  return {
+    fwdX: carFwdX,
+    fwdZ: carFwdZ,
+    dist: 6.4,
+    height: 2.2,
+    verticalOffset: 2.2,
+    driftSwing: 0,
+  };
+}
+
+function expDamp(current: number, target: number, lambda: number, dt: number): number {
+  return current + (target - current) * (1 - Math.exp(-lambda * Math.max(0, dt)));
+}
+
+/**
+ * Computes a car-anchored chase camera pose by damping relative follow distance,
+ * elevation, heading, and drift swing in the vehicle's local reference frame.
+ * Eliminates world-space translation lag and frame-time rubber-banding at 200-360 km/h.
+ */
+export function stepChaseCameraRelative(
+  state: ChaseCameraState,
+  input: {
+    carX: number;
+    carY: number;
+    carZ: number;
+    carFwdX: number;
+    carFwdZ: number;
+    visualYawOffset: number;
+    kmh: number;
+    throttle: number;
+    isBoosting: boolean;
+    isTitan: boolean;
+    dt: number;
+    getGroundHeight?: (x: number, z: number) => number;
+  },
+): {
+  state: ChaseCameraState;
+  camX: number;
+  camY: number;
+  camZ: number;
+  lookAtX: number;
+  lookAtY: number;
+  lookAtZ: number;
+} {
+  const dt = Math.max(0, Math.min(0.05, input.dt));
+  const speedRatio = Math.max(0, Math.min(1, input.kmh / 245));
+
+  // Damp camera forward unit vector smoothly toward vehicle forward vector
+  let fwdX = expDamp(state.fwdX, input.carFwdX, 12, dt);
+  let fwdZ = expDamp(state.fwdZ, input.carFwdZ, 12, dt);
+  const fwdLen = Math.hypot(fwdX, fwdZ) || 1;
+  fwdX /= fwdLen;
+  fwdZ /= fwdLen;
+
+  const rightX = -fwdZ;
+  const rightZ = fwdX;
+
+  const targetDist =
+    6.4 +
+    (input.throttle > 0 ? 0.45 : 0) +
+    (input.isBoosting ? 0.55 : 0) +
+    (input.isTitan ? 0.6 : 0);
+  const targetHeight = 2.2 + speedRatio * 0.35 + (input.isTitan ? 0.45 : 0);
+  const targetSwing = input.visualYawOffset * 1.35;
+
+  const dist = expDamp(state.dist, targetDist, 10, dt);
+  const height = expDamp(state.height, targetHeight, 10, dt);
+  const driftSwing = expDamp(state.driftSwing, targetSwing, 12, dt);
+
+  const camX = input.carX - fwdX * dist + rightX * driftSwing;
+  const camZ = input.carZ - fwdZ * dist + rightZ * driftSwing;
+
+  let minGroundY = -Infinity;
+  if (input.getGroundHeight) {
+    minGroundY = input.getGroundHeight(camX, camZ) + 1.45;
+  }
+  const desiredY = Math.max(input.carY + height, minGroundY);
+  const targetVerticalOffset = desiredY - input.carY;
+  const verticalOffset = expDamp(state.verticalOffset, targetVerticalOffset, 14, dt);
+  const camY = Math.max(minGroundY, input.carY + verticalOffset);
+
+  const lookAtX = input.carX + fwdX * 8.5 + rightX * (driftSwing * 0.3);
+  const lookAtY = input.carY + 0.82;
+  const lookAtZ = input.carZ + fwdZ * 8.5 + rightZ * (driftSwing * 0.3);
+
+  return {
+    state: {
+      fwdX,
+      fwdZ,
+      dist,
+      height,
+      verticalOffset,
+      driftSwing,
+    },
+    camX,
+    camY,
+    camZ,
+    lookAtX,
+    lookAtY,
+    lookAtZ,
+  };
+}
+
+export type SurfaceType = 'asphalt' | 'shoulder' | 'dirt' | 'snow' | 'water';
+
+export interface SurfacePhysicsProfile {
+  surface: SurfaceType;
+  gripMu: number;
+  rollingResistance: number;
+  waterDepth: number;
+  waterDragCoeff: number;
+  surfaceRoughnessAmp: number;
+}
+
+export const OASIS_WATER_LEVEL = -1.6;
+
+/**
+ * Computes real surface-dependent tire friction (mu), rolling resistance,
+ * hydrodynamic water drag (in Oasis Lake), and terrain micro-bump roughness.
+ */
+export function computeSurfacePhysicsProfile(input: {
+  groundY: number;
+  roadDistance: number;
+  carId: CarId;
+  sceneryId: SceneryId;
+}): SurfacePhysicsProfile {
+  const isTitan = input.carId === 'titan';
+  const waterSurfaceY = OASIS_WATER_LEVEL + 0.15;
+
+  if (input.groundY < waterSurfaceY) {
+    const waterDepth = Math.max(0.05, Math.min(2.8, waterSurfaceY - input.groundY));
+    return {
+      surface: 'water',
+      gripMu: isTitan ? 0.86 : 0.68,
+      rollingResistance: isTitan ? 0.65 : 1.15,
+      waterDepth,
+      waterDragCoeff: Math.min(1.45, waterDepth * (isTitan ? 0.34 : 0.68)),
+      surfaceRoughnessAmp: 0.014,
+    };
+  }
+
+  if (input.roadDistance <= ROAD_HALF_WIDTH + 0.8) {
+    return {
+      surface: 'asphalt',
+      gripMu: 1.08,
+      rollingResistance: 0.36,
+      waterDepth: 0,
+      waterDragCoeff: 0,
+      surfaceRoughnessAmp: 0,
+    };
+  }
+
+  if (input.roadDistance <= ROAD_HALF_WIDTH + 4.2) {
+    return {
+      surface: 'shoulder',
+      gripMu: isTitan ? 1.02 : 0.94,
+      rollingResistance: 0.48,
+      waterDepth: 0,
+      waterDragCoeff: 0,
+      surfaceRoughnessAmp: 0.01,
+    };
+  }
+
+  if (input.sceneryId === 'alpine') {
+    return {
+      surface: 'snow',
+      gripMu: isTitan ? 0.92 : 0.72,
+      rollingResistance: isTitan ? 0.46 : 0.82,
+      waterDepth: 0,
+      waterDragCoeff: 0,
+      surfaceRoughnessAmp: 0.028,
+    };
+  }
+
+  return {
+    surface: 'dirt',
+    gripMu: isTitan ? 0.98 : 0.82,
+    rollingResistance: isTitan ? 0.42 : 0.74,
+    waterDepth: 0,
+    waterDragCoeff: 0,
+    surfaceRoughnessAmp: 0.032,
+  };
+}
+
+export interface AutomotiveHorizontalPhysicsInput {
+  vx: number;
+  vz: number;
+  yaw: number;
+  yawRate: number;
+  visualYawOffset: number;
+  steerAngle: number;
+  throttle: number;
+  handbrake: boolean;
+  isGrounded: boolean;
+  terrainPitch: number;
+  terrainRoll: number;
+  carSpec: CarSpec;
+  surfaceProfile: SurfacePhysicsProfile;
+  dt: number;
+}
+
+export interface AutomotiveHorizontalPhysicsOutput {
+  vx: number;
+  vz: number;
+  yaw: number;
+  yawRate: number;
+  visualYawOffset: number;
+  vLong: number;
+  vLat: number;
+  accelLong: number;
+  accelLat: number;
+  slipAngleRad: number;
+  isDrifting: boolean;
+}
+
+/**
+ * Steps real 2D automotive dynamics including:
+ * - Terrain slope gravity forces (uphill resistance, downhill gravity acceleration, camber pull)
+ * - Quadratic aerodynamic drag + rolling resistance + Oasis water hydrodynamic drag
+ * - Longitudinal weight transfer (trail-braking front bite vs throttle rear squat)
+ * - Pacejka-inspired lateral tire cornering force, slip angle, and self-aligning counter-steer
+ */
+export function stepAutomotiveHorizontalPhysics(
+  input: AutomotiveHorizontalPhysicsInput,
+): AutomotiveHorizontalPhysicsOutput {
+  const dt = Math.max(0.0005, Math.min(0.05, input.dt));
+  const { carSpec, surfaceProfile } = input;
+  const mu = surfaceProfile.gripMu;
+
+  const prevFwdX = -Math.sin(input.yaw);
+  const prevFwdZ = -Math.cos(input.yaw);
+  const speedMs = Math.hypot(input.vx, input.vz);
+  const kmh = speedMs * 3.6;
+  const prevForwardVel = input.vx * prevFwdX + input.vz * prevFwdZ;
+  const prevRightX = Math.cos(input.yaw);
+  const prevRightZ = -Math.sin(input.yaw);
+  const prevLatVel = input.vx * prevRightX + input.vz * prevRightZ;
+
+  // Tire slip angle (angle between velocity vector and chassis heading)
+  const slipAngleRad = speedMs > 1.5 ? Math.atan2(prevLatVel, Math.abs(prevForwardVel) + 1.2) : 0;
+
+  // Approximate longitudinal acceleration for weight transfer
+  const estAccelLong =
+    input.throttle > 0 ? carSpec.accelRate * 0.7 : input.throttle < 0 ? -28 : -1.5;
+  // Front axle weight shift under braking improves turn-in response (trail-braking)
+  const frontLoadFactor = Math.max(0.82, Math.min(1.24, 1.0 - estAccelLong * 0.008));
+
+  let yaw = input.yaw;
+  let yawRate = input.yawRate;
+  let visualYawOffset = input.visualYawOffset;
+
+  if (input.isGrounded && speedMs > 0.35) {
+    const revSign = prevForwardVel < -0.5 ? -1 : 1;
+    const lowSpeedFactor = Math.min(1, speedMs / 8.5);
+    const baseTurnRate =
+      carSpec.steerRate *
+      frontLoadFactor *
+      (0.35 + 0.65 * Math.min(1.1, mu)) *
+      (input.handbrake ? carSpec.driftSteerMultiplier : 1);
+
+    const desiredYawRate = input.steerAngle * baseTurnRate * lowSpeedFactor * revSign;
+    // Self-aligning counter-steer torque helps stabilize drifts when steering into the slide
+    const selfAlignTorque = -slipAngleRad * (input.handbrake ? 0.55 : 1.15);
+    const targetYawRate = desiredYawRate + selfAlignTorque * 0.22;
+
+    yawRate = expDamp(yawRate, targetYawRate, input.handbrake ? 10.5 : 14.5, dt);
+    yaw += yawRate * dt;
+
+    const slipTarget =
+      input.handbrake && speedMs > 7.0
+        ? input.steerAngle * 0.7 * (carSpec.id === 'kaze' ? 1.16 : 1) +
+          Math.max(-0.28, Math.min(0.28, -slipAngleRad * 0.35))
+        : input.steerAngle * Math.min(1, kmh / 175) * (0.14 / Math.max(0.65, mu));
+
+    visualYawOffset = expDamp(
+      visualYawOffset,
+      slipTarget,
+      input.handbrake ? 7.5 : 10.0,
+      dt,
+    );
+  } else {
+    yawRate = expDamp(yawRate, 0, 5, dt);
+    yaw += yawRate * dt * 0.35;
+    visualYawOffset = expDamp(visualYawOffset, 0, 6, dt);
+  }
+
+  const newFwdX = -Math.sin(yaw);
+  const newFwdZ = -Math.cos(yaw);
+  const newRightX = Math.cos(yaw);
+  const newRightZ = -Math.sin(yaw);
+
+  let vLong = input.vx * newFwdX + input.vz * newFwdZ;
+  let vLat = input.vx * newRightX + input.vz * newRightZ;
+  const vLongBefore = vLong;
+
+  if (input.isGrounded) {
+    const surfaceSpeedCapFactor =
+      surfaceProfile.surface === 'asphalt' || surfaceProfile.surface === 'shoulder'
+        ? 1.0
+        : carSpec.id === 'titan'
+          ? 0.98
+          : 0.88;
+    const maxCarMs = (carSpec.maxSpeedKmh * surfaceSpeedCapFactor) / 3.6;
+
+    // 1. Slope gravity force along terrain pitch (climbing hills slows car; descending accelerates)
+    const gravityLong = -9.81 * Math.sin(input.terrainPitch) * 0.58;
+    // 2. Camber gravity force along terrain roll
+    const gravityLat = 9.81 * Math.sin(input.terrainRoll) * 0.38;
+
+    // 3. Engine traction / Braking
+    const tractionScale = 0.4 + 0.6 * Math.min(1.08, mu);
+    if (input.throttle > 0) {
+      const headroom = Math.max(0, 1 - Math.max(0, vLong) / maxCarMs);
+      const engineAccel =
+        vLong < 0
+          ? 34 * tractionScale
+          : carSpec.accelRate * tractionScale * Math.pow(headroom, 0.68);
+      vLong += engineAccel * dt;
+    } else if (input.throttle < 0) {
+      if (vLong > 1.2) {
+        vLong = Math.max(0, vLong - 39 * tractionScale * dt);
+      } else if (vLong > -68 / 3.6) {
+        vLong -= 16.5 * tractionScale * dt;
+      }
+    } else {
+      // Engine braking + rolling resistance
+      vLong *= Math.exp(-surfaceProfile.rollingResistance * dt);
+      if (Math.abs(vLong) < 0.14 && Math.abs(gravityLong) < 0.4) vLong = 0;
+    }
+
+    // Apply slope gravity when moving or when throttle is applied / steep slope
+    if (Math.abs(vLong) > 0.25 || Math.abs(input.throttle) > 0.01) {
+      vLong += gravityLong * dt;
+      vLat += gravityLat * dt;
+    }
+
+    // 4. Quadratic aerodynamic drag + water hydrodynamic drag
+    const aeroDragDecel = 0.00018 * vLong * Math.abs(vLong);
+    vLong -= aeroDragDecel * dt;
+    if (surfaceProfile.waterDragCoeff > 0) {
+      const waterFactor = Math.exp(-surfaceProfile.waterDragCoeff * dt);
+      vLong *= waterFactor;
+      vLat *= waterFactor;
+    }
+
+    // 5. Handbrake & Lateral Pacejka-inspired tire cornering damping
+    if (input.handbrake) {
+      vLong *= Math.exp(-0.62 * dt);
+    }
+    const baseLatGrip = input.handbrake
+      ? carSpec.driftLateralDamping * Math.min(1, mu)
+      : 12.2 * Math.pow(Math.min(1.08, mu), 1.15);
+    vLat *= Math.exp(-baseLatGrip * dt);
+  } else {
+    // Airborne air resistance
+    vLong *= Math.exp(-0.08 * dt);
+    vLat *= Math.exp(-0.08 * dt);
+  }
+
+  const vx = newFwdX * vLong + newRightX * vLat;
+  const vz = newFwdZ * vLong + newRightZ * vLat;
+  const accelLong = (vLong - vLongBefore) / dt;
+  const accelLat = vLong * yawRate;
+
+  const isDrifting =
+    input.isGrounded &&
+    speedMs > 7.5 &&
+    (input.handbrake || Math.abs(visualYawOffset) > 0.15 || Math.abs(slipAngleRad) > 0.22);
+
+  return {
+    vx,
+    vz,
+    yaw,
+    yawRate,
+    visualYawOffset,
+    vLong,
+    vLat,
+    accelLong,
+    accelLat,
+    slipAngleRad,
+    isDrifting,
+  };
+}
+
+export type MapColliderKind = 'rigid' | 'smashable' | 'rival';
+
+export interface MapColliderImpactInput {
+  carX: number;
+  carZ: number;
+  carVx: number;
+  carVz: number;
+  carYaw: number;
+  carRadius: number;
+  colX: number;
+  colZ: number;
+  colRadius: number;
+  kind: MapColliderKind;
+}
+
+export interface MapColliderImpactOutput {
+  collided: boolean;
+  carX: number;
+  carZ: number;
+  carVx: number;
+  carVz: number;
+  carYawDelta: number;
+  impactSpeedKmh: number;
+  normalX: number;
+  normalZ: number;
+  propLaunchVx: number;
+  propLaunchVy: number;
+  propLaunchVz: number;
+}
+
+/**
+ * Resolves 2D physical collisions between the car chassis and map obstacles:
+ * - 'rigid' (boulders, rock formations, thick trees, bridge pylons, gate pillars):
+ *   Restitution bounce + wall-scrape tangential friction + off-center yaw deflection.
+ * - 'smashable' (Forza Horizon bollards, festival flags, saplings):
+ *   Launches the destructible prop airborne with 3D impulse while scrubbing minimal car momentum.
+ * - 'rival' (AI Drivatar cars):
+ *   Elastic/inelastic momentum transfer + lateral knockback.
+ */
+export function resolveMapColliderImpact(
+  input: MapColliderImpactInput,
+): MapColliderImpactOutput {
+  const dx = input.carX - input.colX;
+  const dz = input.carZ - input.colZ;
+  const dist = Math.hypot(dx, dz);
+  const minSep = input.carRadius + input.colRadius;
+
+  if (dist >= minSep) {
+    return {
+      collided: false,
+      carX: input.carX,
+      carZ: input.carZ,
+      carVx: input.carVx,
+      carVz: input.carVz,
+      carYawDelta: 0,
+      impactSpeedKmh: 0,
+      normalX: 0,
+      normalZ: -1,
+      propLaunchVx: 0,
+      propLaunchVy: 0,
+      propLaunchVz: 0,
+    };
+  }
+
+  // Unit collision normal pointing from obstacle center to car center
+  const nx = dist > 0.0001 ? dx / dist : -Math.sin(input.carYaw);
+  const nz = dist > 0.0001 ? dz / dist : -Math.cos(input.carYaw);
+  const overlap = minSep - dist;
+
+  const carSpeedMs = Math.hypot(input.carVx, input.carVz);
+  const carSpeedKmh = carSpeedMs * 3.6;
+
+  if (input.kind === 'smashable') {
+    // Smash through destructible prop! Launch prop forward & upward with car velocity
+    const launchSpeed = Math.max(12, carSpeedMs * 1.25);
+    const propLaunchVx = input.carVx * 1.15 - nx * launchSpeed * 0.45;
+    const propLaunchVz = input.carVz * 1.15 - nz * launchSpeed * 0.45;
+    const propLaunchVy = Math.min(18, 5.5 + carSpeedMs * 0.24);
+
+    // Slight 2% speed scrub from smashing the prop
+    return {
+      collided: true,
+      carX: input.carX,
+      carZ: input.carZ,
+      carVx: input.carVx * 0.98,
+      carVz: input.carVz * 0.98,
+      carYawDelta: 0,
+      impactSpeedKmh: carSpeedKmh,
+      normalX: nx,
+      normalZ: nz,
+      propLaunchVx,
+      propLaunchVy,
+      propLaunchVz,
+    };
+  }
+
+  // Push car cleanly out of penetration
+  const pushFactor = input.kind === 'rival' ? 0.85 : 1.02;
+  const nextX = input.carX + nx * overlap * pushFactor;
+  const nextZ = input.carZ + nz * overlap * pushFactor;
+
+  // Decompose car velocity into normal (along n) and tangential (along t) components
+  const tx = -nz;
+  const tz = nx;
+  const vn = input.carVx * nx + input.carVz * nz;
+  const vt = input.carVx * tx + input.carVz * tz;
+
+  const impactSpeedKmh = Math.max(0, -vn * 3.6);
+  let nextVx = input.carVx;
+  let nextVz = input.carVz;
+  let carYawDelta = 0;
+
+  if (vn < 0) {
+    const restitution = input.kind === 'rival' ? 0.35 : 0.26;
+    const wallFriction = input.kind === 'rival' ? 0.88 : 0.78;
+    const bouncedVn = Math.max(1.8, -vn * restitution);
+    const scrapedVt = vt * wallFriction;
+    nextVx = nx * bouncedVn + tx * scrapedVt;
+    nextVz = nz * bouncedVn + tz * scrapedVt;
+
+    // Off-center glancing blow imparts realistic yaw deflection
+    const fwdX = -Math.sin(input.carYaw);
+    const fwdZ = -Math.cos(input.carYaw);
+    const cross = fwdX * nz - fwdZ * nx;
+    carYawDelta = Math.max(-0.22, Math.min(0.22, cross * Math.min(1, impactSpeedKmh / 140) * 0.16));
+  }
+
+  return {
+    collided: true,
+    carX: nextX,
+    carZ: nextZ,
+    carVx: nextVx,
+    carVz: nextVz,
+    carYawDelta,
+    impactSpeedKmh,
+    normalX: nx,
+    normalZ: nz,
+    propLaunchVx: -nx * Math.max(4, -vn * 0.65),
+    propLaunchVy: 0,
+    propLaunchVz: -nz * Math.max(4, -vn * 0.65),
+  };
+}
+
 
